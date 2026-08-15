@@ -18,6 +18,7 @@ KR = [
     ("105560", "KB금융", "KOSPI", "105560.KS"),
     ("055550", "신한지주", "KOSPI", "055550.KS"),
     ("035420", "NAVER", "KOSPI", "035420.KS"),
+    ("035720", "카카오", "KOSPI", "035720.KS"),
     ("012450", "한화에어로스페이스", "KOSPI", "012450.KS"),
     ("247540", "에코프로비엠", "KOSDAQ", "247540.KQ"),
 ]
@@ -35,7 +36,14 @@ US = [
     ("JPM", "JPMorgan Chase", "NYSE", "JPM"),
     ("WMT", "Walmart", "NYSE", "WMT"),
     ("AMD", "AMD", "NASDAQ", "AMD"),
+    ("NFLX", "Netflix", "NASDAQ", "NFLX"),
+    ("PLTR", "Palantir", "NASDAQ", "PLTR"),
+    ("ORCL", "Oracle", "NYSE", "ORCL"),
+    ("COST", "Costco", "NASDAQ", "COST"),
+    ("KO", "Coca-Cola", "NYSE", "KO"),
+    ("CRM", "Salesforce", "NYSE", "CRM"),
 ]
+
 
 
 def _cached(key, ttl, loader):

@@ -77,3 +77,17 @@ No Supabase SQL change and no new Render environment variable are required.
 ## Note
 
 Plotly stock-detail charts remain dark-themed in this release, even if the surrounding page is light. This makes candlesticks consistently legible. A later version can rebuild Plotly figures when the theme changes if full chart-theme synchronization is desired.
+
+
+## v0.6.1 UI patch
+
+- Increased inactive filter text contrast in dark mode.
+- Fixed active filter class switching.
+- Removed card skeleton placeholders that could remain as tall empty rectangles.
+- Loading placeholders now use compact spinners only.
+- Representative stocks increased from 6 to 12.
+- Wide-screen representative layout changed to 4 columns.
+- Expanded the representative universes so the 12-card view has enough candidates.
+
+Performance impact of 12 cards is modest because quote history for the representative
+universe is still fetched in a single batch request per market/mode and cached.

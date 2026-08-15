@@ -137,13 +137,25 @@ def add_style():
             }
             .q-btn.filter-button {
                 border-radius:9px!important;
-                min-height:34px!important;
-                padding:0 14px!important;
-                color:var(--muted)!important;
+                min-height:36px!important;
+                padding:0 15px!important;
+                color:var(--text)!important;
+                font-weight:700!important;
+                opacity:.72;
+            }
+            .q-btn.filter-button:hover {
+                opacity:1;
+                background:var(--surface-2)!important;
             }
             .q-btn.filter-active {
                 background:var(--blue)!important;
                 color:white!important;
+                opacity:1!important;
+                box-shadow:0 2px 8px rgba(37,99,235,.22);
+            }
+            body.body--dark .q-btn.filter-button:not(.filter-active) {
+                color:#d7e0ec!important;
+                opacity:.82;
             }
             .search-box .q-field__control,.auth-input .q-field__control {
                 background:var(--surface)!important;
@@ -452,10 +464,8 @@ async def public_home():
         market_grid = ui.grid(columns=7).classes(
             "w-full gap-2 max-xl:grid-cols-4 max-md:grid-cols-2"
         )
-        for _ in range(7):
-            ui.card().classes(
-                "surface loading-shimmer h-[145px]"
-            )
+        with market_grid:
+            ui.spinner(size="md").classes("m-6")
 
     with stocks_host:
         ui.label("오늘의 대표 종목").classes("section-title")
@@ -480,23 +490,19 @@ async def public_home():
                 "거래 활발"
             ).props("flat no-caps dense").classes("filter-button")
 
-        stock_grid = ui.grid(columns=3).classes(
-            "w-full gap-3 mt-4 max-lg:grid-cols-2 max-md:grid-cols-1"
+        stock_grid = ui.grid(columns=4).classes(
+            "w-full gap-3 mt-4 max-xl:grid-cols-3 max-lg:grid-cols-2 max-md:grid-cols-1"
         )
-        for _ in range(6):
-            ui.card().classes(
-                "surface loading-shimmer h-[220px]"
-            )
+        with stock_grid:
+            ui.spinner(size="md").classes("m-8")
 
     with macro_host:
         ui.label("주요 경제지표").classes("section-title")
         macro_grid = ui.grid(columns=4).classes(
             "w-full gap-3 mt-3 max-md:grid-cols-2"
         )
-        for _ in range(4):
-            ui.card().classes(
-                "surface loading-shimmer h-[105px]"
-            )
+        with macro_grid:
+            ui.spinner(size="md").classes("m-6")
 
     with news_host:
         ui.label("시장 뉴스").classes("section-title")
@@ -535,23 +541,23 @@ async def public_home():
                         ui.html(svg).classes("w-full mt-2")
 
     def paint_filter_buttons():
-        for button, active in [
+        pairs = [
             (kr_btn, state["market"] == "KR"),
             (us_btn, state["market"] == "US"),
             (cap_btn, state["mode"] == "cap"),
             (volume_btn, state["mode"] == "volume"),
-        ]:
-            button.classes(
-                add="filter-active" if active else "",
-                remove="" if active else "filter-active",
-            )
+        ]
+        for button, active in pairs:
+            button.classes(remove="filter-active")
+            if active:
+                button.classes(add="filter-active")
 
     async def load_stocks():
         data = await asyncio.to_thread(
             get_representative_stocks,
             state["market"],
             state["mode"],
-            6,
+            12,
         )
         stock_grid.clear()
         with stock_grid:
