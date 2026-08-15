@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: my-market-nicegui
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: KIS_ENV
+        value: real
+      - key: REFRESH_SECONDS
+        value: 5
+      - key: KIS_APP_KEY
+        sync: false
+      - key: KIS_APP_SECRET
+        sync: false
