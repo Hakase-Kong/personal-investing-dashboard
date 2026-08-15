@@ -242,3 +242,57 @@ def get_watchlist_news(items, limit=8):
         600,
         load,
     )
+
+
+def get_sparkline_svg(market, exchange, symbol, width=300, height=74):
+    """Return a lightweight 30-trading-day SVG sparkline for a stock card."""
+    yahoo_symbol = symbol
+    if market == "KR":
+        yahoo_symbol = (
+            f"{symbol}.KQ"
+            if "KOSDAQ" in str(exchange).upper()
+            else f"{symbol}.KS"
+        )
+
+    def load():
+        try:
+            frame = yf.download(
+                yahoo_symbol,
+                period="2mo",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if frame.empty:
+                return ""
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            closes = pd.to_numeric(frame["Close"], errors="coerce").dropna().tail(30).tolist()
+            if len(closes) < 2:
+                return ""
+
+            lo, hi = min(closes), max(closes)
+            span = max(hi - lo, 1e-9)
+            pad_x, pad_y = 4, 6
+            usable_w = width - pad_x * 2
+            usable_h = height - pad_y * 2
+            points = []
+            for i, value in enumerate(closes):
+                x = pad_x + usable_w * i / (len(closes) - 1)
+                y = pad_y + usable_h * (hi - value) / span
+                points.append(f"{x:.1f},{y:.1f}")
+
+            stroke = "var(--red)" if closes[-1] >= closes[0] else "var(--down)"
+            return (
+                f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+                f'preserveAspectRatio="none" aria-label="30일 미니차트">'
+                f'<polyline points="{" ".join(points)}" fill="none" '
+                f'stroke="{stroke}" stroke-width="2.1" '
+                f'stroke-linecap="round" stroke-linejoin="round" />'
+                f'</svg>'
+            )
+        except Exception:
+            return ""
+
+    return _cached(f"spark-v08:{market}:{exchange}:{symbol}", 600, load)
