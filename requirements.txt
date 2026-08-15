@@ -2,3 +2,4 @@ nicegui>=3.0,<4
 requests>=2.32
 python-dotenv>=1.0
 yfinance>=0.2.54
+supabase>=2.18,<3
