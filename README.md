@@ -1,106 +1,79 @@
-# My Market v0.5 — Public Home + Personal Dashboard
+# My Market v0.6 — Search, Sparklines, Speed, Theme
 
-## Route structure
+## Main improvements
+
+### 1. Public search
+The `/` public dashboard now has the same type-ahead stock search as the personal dashboard.
+
+- 280 ms trailing throttle
+- stale-result protection
+- search result opens public stock chart
+- no login required
+
+### 2. Market and macro mini charts
+Market cards now receive 30 recent daily values in the same batch request used for the headline value.
+
+- KOSPI
+- KOSDAQ
+- S&P 500
+- NASDAQ
+- VIX
+- USD/KRW
+- US 10Y
+
+Macro cards also contain recent FRED series and can render a sparkline.
+
+### 3. Performance optimizations
+The public page now:
+- renders shell/skeletons first
+- uses one batched Yahoo download for all market indices instead of seven downloads
+- uses one batched download per representative stock universe
+- loads market / representative stocks / macro / news concurrently with `asyncio.gather`
+- caches market data for 120s
+- caches representative stocks for 180s
+- caches macro for 30 minutes
+- caches news for 10 minutes
+- protects autocomplete from stale slower responses
+
+The personal dashboard also parallelizes Supabase profile/watchlist and macro loading.
+
+### 4. Cleaner representative-stock filters
+Instead of two separate NiceGUI toggle rows, the controls now appear as one compact segmented toolbar:
 
 ```text
-/             Public market dashboard (no login required)
-/login        Login
-/signup       Email signup
-/dashboard    Personal dashboard (login required)
-/stock/...    Public stock detail/chart
+[ 한국장 ] [ 미국장 ] | [ 시가총액 대표 ] [ 거래 활발 ]
 ```
 
-## Public home
+Active choices use the app accent color.
 
-- KOSPI / KOSDAQ / S&P 500 / NASDAQ / VIX / USD-KRW / US10Y
-- Korea / US representative stock tabs
-- "시가총액 대표" tab
-- "거래 활발" tab
-- Recent daily sparkline on representative stocks
-- FRED macro indicators
-- Market news
-- Login / personal-dashboard CTA
+### 5. Theme
+Default is **System**.
 
-### Important ranking note
+Header contrast icon menu:
+- 시스템 설정
+- 라이트 모드
+- 다크 모드
 
-This zero-cost prototype does **not** claim to screen every listed stock in real time.
+NiceGUI's `ui.dark_mode(value=None)` follows the browser/OS color preference.
+The selected override is saved in `app.storage.user`.
 
-- `시가총액 대표`: curated large-cap universe, ordered as representative large caps.
-- `거래 활발`: dynamically sorted by latest volume inside that representative universe.
-
-This avoids dozens/hundreds of KIS/Yahoo calls on every anonymous page view.
-A later version can replace this with KIS ranking APIs and the official KRX/KIS master universe.
-
-## Personal dashboard
-
-- Supabase Auth
-- User-specific watchlist
-- Type-ahead search
-- Current price
-- 30-day mini chart
-- Watchlist news
-- Macro indicators
-
-## Stock detail
-
-No login required:
-- Current price
-- 1D / daily / weekly / monthly chart
-- MA5 / MA20 / MA60 / MA120
-- Previous-page button
-- Market-home button
-
-If logged in:
-- Add stock to personal watchlist
-- Personal-dashboard button
-
-## GitHub files
-
-Upload/replace:
+## Files to replace
 
 ```text
 main.py
-public_data.py
 dashboard_data.py
-chart_data.py
-kis.py
+public_data.py
 market_data.py
 supabase_store.py
+kis.py
+chart_data.py
 requirements.txt
 render.yaml
 .gitignore
 ```
 
-No Supabase schema change is required from v0.3/v0.4.
+No Supabase SQL change and no new Render environment variable are required.
 
-## Render
+## Note
 
-No new environment variable is required.
-
-Keep:
-
-```text
-APP_URL
-KIS_APP_KEY
-KIS_APP_SECRET
-KIS_ENV
-SUPABASE_URL
-SUPABASE_PUBLISHABLE_KEY
-STORAGE_SECRET
-ENABLE_GOOGLE
-ENABLE_KAKAO
-ENABLE_NAVER
-ENABLE_APPLE
-REFRESH_SECONDS
-```
-
-## Notes
-
-The public dashboard uses free/unofficial Yahoo Finance data for several market
-views and representative-stock calculations. This is appropriate for a personal
-prototype, but redistribution/licensing should be reviewed before opening the
-service broadly or using it commercially.
-
-NiceGUI pages build a visible shell before expensive remote requests whenever
-possible, then wait for the client connection before performing asynchronous
-API work.
+Plotly stock-detail charts remain dark-themed in this release, even if the surrounding page is light. This makes candlesticks consistently legible. A later version can rebuild Plotly figures when the theme changes if full chart-theme synchronization is desired.

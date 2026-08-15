@@ -5,7 +5,6 @@ import plotly.graph_objects as go
 import yfinance as yf
 from plotly.subplots import make_subplots
 _CACHE={};_LOCK=Lock()
-
 def _cached(k,ttl,loader):
     now=time.time()
     with _LOCK:
