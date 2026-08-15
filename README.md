@@ -1,46 +1,66 @@
-# My Market v0.4 Dashboard
+# My Market v0.5 — Public Home + Personal Dashboard
 
-## v0.4 improvements
+## Route structure
 
-1. Search autocomplete
-   - Search runs while typing.
-   - 350ms trailing throttle.
-   - Enter still works.
+```text
+/             Public market dashboard (no login required)
+/login        Login
+/signup       Email signup
+/dashboard    Personal dashboard (login required)
+/stock/...    Public stock detail/chart
+```
 
-2. Watchlist mini charts
-   - 30 latest daily closes.
-   - Lightweight SVG sparkline.
-   - Cached 10 minutes.
+## Public home
 
-3. Market / macro / news
-   - KOSPI, KOSDAQ, S&P 500, NASDAQ, VIX, USD/KRW, US 10Y.
-   - FRED: US 10Y, Fed Funds, CPI YoY, unemployment.
-   - Watchlist-related Yahoo Finance news.
-   - Market cache: 60 seconds.
-   - Macro cache: 15 minutes.
-   - News cache: 5 minutes.
+- KOSPI / KOSDAQ / S&P 500 / NASDAQ / VIX / USD-KRW / US10Y
+- Korea / US representative stock tabs
+- "시가총액 대표" tab
+- "거래 활발" tab
+- Recent daily sparkline on representative stocks
+- FRED macro indicators
+- Market news
+- Login / personal-dashboard CTA
 
-4. Clock
-   - KST and New York time.
-   - Updates once per second.
+### Important ranking note
 
-5. Stock detail navigation
-   - Sticky "관심종목으로 돌아가기" button.
-   - Home button.
-   - Bottom back button.
+This zero-cost prototype does **not** claim to screen every listed stock in real time.
 
-6. 500 timeout fix
-   - Detail page shell is rendered first.
-   - Remote calls begin after `ui.context.client.connected()`.
-   - response_timeout=15 is an additional safety margin.
-   - 1D/W/M charts load only when selected.
+- `시가총액 대표`: curated large-cap universe, ordered as representative large caps.
+- `거래 활발`: dynamically sorted by latest volume inside that representative universe.
 
-## GitHub
+This avoids dozens/hundreds of KIS/Yahoo calls on every anonymous page view.
+A later version can replace this with KIS ranking APIs and the official KRX/KIS master universe.
+
+## Personal dashboard
+
+- Supabase Auth
+- User-specific watchlist
+- Type-ahead search
+- Current price
+- 30-day mini chart
+- Watchlist news
+- Macro indicators
+
+## Stock detail
+
+No login required:
+- Current price
+- 1D / daily / weekly / monthly chart
+- MA5 / MA20 / MA60 / MA120
+- Previous-page button
+- Market-home button
+
+If logged in:
+- Add stock to personal watchlist
+- Personal-dashboard button
+
+## GitHub files
 
 Upload/replace:
 
 ```text
 main.py
+public_data.py
 dashboard_data.py
 chart_data.py
 kis.py
@@ -51,13 +71,11 @@ render.yaml
 .gitignore
 ```
 
-No DB schema change is required from v0.3.
-
-Never upload `.env`.
+No Supabase schema change is required from v0.3/v0.4.
 
 ## Render
 
-No new environment variable is required for v0.4.
+No new environment variable is required.
 
 Keep:
 
@@ -76,13 +94,13 @@ ENABLE_APPLE
 REFRESH_SECONDS
 ```
 
-## Data notes
+## Notes
 
-- Korean current price/full chart: KIS.
-- Mini card sparkline and US stock market data: Yahoo Finance via yfinance.
-- US macro indicators: FRED public CSV downloads.
-- News: Yahoo Finance via yfinance.
+The public dashboard uses free/unofficial Yahoo Finance data for several market
+views and representative-stock calculations. This is appropriate for a personal
+prototype, but redistribution/licensing should be reviewed before opening the
+service broadly or using it commercially.
 
-These public/free sources are suitable for a personal dashboard prototype but
-are not a licensed redistribution feed. If the service is opened widely,
-review data redistribution/licensing before treating it as a commercial market-data service.
+NiceGUI pages build a visible shell before expensive remote requests whenever
+possible, then wait for the client connection before performing asynchronous
+API work.
