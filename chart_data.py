@@ -1,83 +1,284 @@
 import time
 from threading import Lock
+
 import pandas as pd
-import plotly.graph_objects as go
 import yfinance as yf
-from plotly.subplots import make_subplots
-_CACHE={};_LOCK=Lock()
-def _cached(k,ttl,loader):
-    now=time.time()
+
+_CACHE = {}
+_LOCK = Lock()
+
+
+def _cached(key, ttl, loader):
+    now = time.time()
     with _LOCK:
-        h=_CACHE.get(k)
-        if h and now-h[0]<ttl:return h[1].copy()
-    v=loader()
-    with _LOCK:_CACHE[k]=(now,v.copy())
-    return v
-def _kr(e,s):return f"{s}.KQ" if "KOSDAQ" in e.upper() else f"{s}.KS"
-def _f(v):
-    try:return None if v in (None,"") else float(v)
-    except Exception:return None
-def _clean(d):
-    if d.empty:return d
-    return d.dropna(subset=["date","open","high","low","close"]).sort_values("date")
-def _kp(kis,s,p):
-    rows=kis.get_domestic_period_chart(s,p,2);d=[]
-    for r in rows:
-        x=r.get("stck_bsop_date")
-        if x:d.append({"date":pd.to_datetime(x,format="%Y%m%d",errors="coerce"),
-        "open":_f(r.get("stck_oprc")),"high":_f(r.get("stck_hgpr")),
-        "low":_f(r.get("stck_lwpr")),"close":_f(r.get("stck_clpr")),"volume":_f(r.get("acml_vol")) or 0})
-    return _clean(pd.DataFrame(d))
-def _ki(kis,s):
-    rows=kis.get_domestic_intraday_chart(s);d=[]
-    for r in rows:
-        x,t=r.get("stck_bsop_date"),r.get("stck_cntg_hour")
-        if x and t:d.append({"date":pd.to_datetime(f"{x}{t}",format="%Y%m%d%H%M%S",errors="coerce"),
-        "open":_f(r.get("stck_oprc")),"high":_f(r.get("stck_hgpr")),
-        "low":_f(r.get("stck_lwpr")),"close":_f(r.get("stck_prpr")),"volume":_f(r.get("cntg_vol")) or 0})
-    return _clean(pd.DataFrame(d))
-def _yf(s,p,i):
-    f=yf.download(s,period=p,interval=i,auto_adjust=False,progress=False,threads=False)
-    if f.empty:return pd.DataFrame()
-    if isinstance(f.columns,pd.MultiIndex):f.columns=f.columns.get_level_values(0)
-    f=f.reset_index();dc="Datetime" if "Datetime" in f.columns else "Date"
-    return _clean(pd.DataFrame({"date":pd.to_datetime(f[dc]),"open":pd.to_numeric(f["Open"],errors="coerce"),
-    "high":pd.to_numeric(f["High"],errors="coerce"),"low":pd.to_numeric(f["Low"],errors="coerce"),
-    "close":pd.to_numeric(f["Close"],errors="coerce"),"volume":pd.to_numeric(f["Volume"],errors="coerce").fillna(0)}))
-def get_chart_df(kis,m,e,s,t):
-    k=(m,e,s,t)
-    if m=="KR":
-        if t=="1D":
-            def load():
+        hit = _CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1].copy()
+    value = loader()
+    with _LOCK:
+        _CACHE[key] = (now, value.copy())
+    return value
+
+
+def _kr_symbol(exchange, symbol):
+    return f"{symbol}.KQ" if "KOSDAQ" in str(exchange).upper() else f"{symbol}.KS"
+
+
+def _f(value):
+    try:
+        return None if value in (None, "") else float(value)
+    except Exception:
+        return None
+
+
+def _clean(df):
+    if df.empty:
+        return df
+    return (
+        df.dropna(subset=["date", "open", "high", "low", "close"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+    )
+
+
+def _kis_period(kis, symbol, period):
+    rows = kis.get_domestic_period_chart(symbol, period, pages=2)
+    data = []
+    for row in rows:
+        date = row.get("stck_bsop_date")
+        if not date:
+            continue
+        data.append({
+            "date": pd.to_datetime(date, format="%Y%m%d", errors="coerce"),
+            "open": _f(row.get("stck_oprc")),
+            "high": _f(row.get("stck_hgpr")),
+            "low": _f(row.get("stck_lwpr")),
+            "close": _f(row.get("stck_clpr")),
+            "volume": _f(row.get("acml_vol")) or 0,
+        })
+    return _clean(pd.DataFrame(data))
+
+
+def _kis_intraday(kis, symbol):
+    rows = kis.get_domestic_intraday_chart(symbol)
+    data = []
+    for row in rows:
+        date = row.get("stck_bsop_date")
+        hour = row.get("stck_cntg_hour")
+        if not date or not hour:
+            continue
+        data.append({
+            "date": pd.to_datetime(
+                f"{date}{hour}", format="%Y%m%d%H%M%S", errors="coerce"
+            ),
+            "open": _f(row.get("stck_oprc")),
+            "high": _f(row.get("stck_hgpr")),
+            "low": _f(row.get("stck_lwpr")),
+            "close": _f(row.get("stck_prpr")),
+            "volume": _f(row.get("cntg_vol")) or 0,
+        })
+    return _clean(pd.DataFrame(data))
+
+
+def _yf(symbol, period, interval):
+    frame = yf.download(
+        symbol,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+    if frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    frame = frame.reset_index()
+    date_col = "Datetime" if "Datetime" in frame.columns else "Date"
+    return _clean(pd.DataFrame({
+        "date": pd.to_datetime(frame[date_col]),
+        "open": pd.to_numeric(frame["Open"], errors="coerce"),
+        "high": pd.to_numeric(frame["High"], errors="coerce"),
+        "low": pd.to_numeric(frame["Low"], errors="coerce"),
+        "close": pd.to_numeric(frame["Close"], errors="coerce"),
+        "volume": pd.to_numeric(frame["Volume"], errors="coerce").fillna(0),
+    }))
+
+
+def get_chart_df(kis, market, exchange, symbol, timeframe):
+    key = (market, exchange, symbol, timeframe)
+
+    if market == "KR":
+        if timeframe == "1D":
+            def load_intraday():
                 try:
-                    d=_ki(kis,s)
-                    if not d.empty:return d
-                except Exception:pass
-                return _yf(_kr(e,s),"1d","1m")
-            return _cached(k,60,load)
-        code={"D":"D","W":"W","M":"M"}.get(t,"D")
-        def load():
+                    df = _kis_intraday(kis, symbol)
+                    if not df.empty:
+                        return df
+                except Exception:
+                    pass
+                return _yf(_kr_symbol(exchange, symbol), "1d", "1m")
+            return _cached(key, 45, load_intraday)
+
+        code = {"D": "D", "W": "W", "M": "M"}.get(timeframe, "D")
+
+        def load_period():
             try:
-                d=_kp(kis,s,code)
-                if not d.empty:return d
-            except Exception:pass
-            p,i={"D":("2y","1d"),"W":("5y","1wk"),"M":("10y","1mo")}[t]
-            return _yf(_kr(e,s),p,i)
-        return _cached(k,300,load)
-    p,i,ttl={"1D":("1d","1m",60),"D":("2y","1d",300),"W":("5y","1wk",600),"M":("10y","1mo",900)}.get(t,("2y","1d",300))
-    return _cached(k,ttl,lambda:_yf(s,p,i))
-def get_chart_figure(kis,m,e,s,t,moving_averages=(5,20,60,120)):
-    d=get_chart_df(kis,m,e,s,t)
-    if d.empty:raise RuntimeError("표시할 차트 데이터가 없습니다.")
-    d=d.sort_values("date").drop_duplicates("date",keep="last")
-    for w in moving_averages:d[f"ma{int(w)}"]=d["close"].rolling(int(w)).mean()
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.04,row_heights=[.76,.24])
-    fig.add_trace(go.Candlestick(x=d["date"],open=d["open"],high=d["high"],low=d["low"],close=d["close"],name=s),row=1,col=1)
-    for w in moving_averages:
-        fig.add_trace(go.Scatter(x=d["date"],y=d[f"ma{int(w)}"],mode="lines",name=f"MA{int(w)}",line={"width":1.4}),row=1,col=1)
-    fig.add_trace(go.Bar(x=d["date"],y=d["volume"],name="Volume",opacity=.65),row=2,col=1)
-    fig.update_layout(template="plotly_dark",paper_bgcolor="#0f141c",plot_bgcolor="#0f141c",
-        margin={"l":18,"r":18,"t":45,"b":20},height=610,legend={"orientation":"h","y":1.01,"x":0},
-        xaxis_rangeslider_visible=False,hovermode="x unified",title={"text":f"{s} · {t}","x":.01})
-    fig.update_xaxes(showgrid=False,rangeslider_visible=False);fig.update_yaxes(gridcolor="rgba(148,163,184,.10)",zeroline=False)
-    return fig
+                df = _kis_period(kis, symbol, code)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+            period, interval = {
+                "D": ("2y", "1d"),
+                "W": ("5y", "1wk"),
+                "M": ("10y", "1mo"),
+            }[timeframe]
+            return _yf(_kr_symbol(exchange, symbol), period, interval)
+
+        ttl = {"D": 600, "W": 1800, "M": 3600}[timeframe]
+        return _cached(key, ttl, load_period)
+
+    period, interval, ttl = {
+        "1D": ("1d", "1m", 45),
+        "D": ("2y", "1d", 600),
+        "W": ("5y", "1wk", 1800),
+        "M": ("10y", "1mo", 3600),
+    }.get(timeframe, ("2y", "1d", 600))
+    return _cached(key, ttl, lambda: _yf(symbol, period, interval))
+
+
+def _ma(values, window):
+    series = pd.Series(values, dtype="float64")
+    ma = series.rolling(window).mean()
+    return [None if pd.isna(v) else round(float(v), 4) for v in ma]
+
+
+def get_echart_options(
+    kis,
+    market,
+    exchange,
+    symbol,
+    timeframe="D",
+    moving_averages=(5, 20, 60, 120),
+):
+    df = get_chart_df(kis, market, exchange, symbol, timeframe)
+    if df.empty:
+        raise RuntimeError("표시할 차트 데이터가 없습니다.")
+
+    # Keep enough information but avoid sending unnecessarily huge payloads.
+    if timeframe == "1D":
+        df = df.tail(420)
+    else:
+        df = df.tail(260)
+
+    labels = [
+        d.strftime("%H:%M") if timeframe == "1D" else d.strftime("%Y-%m-%d")
+        for d in pd.to_datetime(df["date"])
+    ]
+    closes = [round(float(v), 4) for v in df["close"]]
+    candles = [
+        [
+            round(float(row.open), 4),
+            round(float(row.close), 4),
+            round(float(row.low), 4),
+            round(float(row.high), 4),
+        ]
+        for row in df.itertuples()
+    ]
+    volumes = [round(float(v), 2) for v in df["volume"]]
+
+    series = [
+        {
+            "name": symbol,
+            "type": "candlestick",
+            "data": candles,
+            "itemStyle": {
+                "color": "#ef4444",
+                "color0": "#3b82f6",
+                "borderColor": "#ef4444",
+                "borderColor0": "#3b82f6",
+            },
+        }
+    ]
+
+    for window in moving_averages:
+        series.append({
+            "name": f"MA{int(window)}",
+            "type": "line",
+            "data": _ma(closes, int(window)),
+            "showSymbol": False,
+            "smooth": False,
+            "lineStyle": {"width": 1.3},
+            "connectNulls": False,
+        })
+
+    series.append({
+        "name": "Volume",
+        "type": "bar",
+        "xAxisIndex": 1,
+        "yAxisIndex": 1,
+        "data": volumes,
+        "itemStyle": {"color": "rgba(148,163,184,.42)"},
+    })
+
+    return {
+        "animation": False,
+        "backgroundColor": "transparent",
+        "legend": {
+            "top": 6,
+            "left": 12,
+            "textStyle": {"color": "#94a3b8"},
+        },
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
+        "axisPointer": {"link": [{"xAxisIndex": "all"}]},
+        "grid": [
+            {"left": 58, "right": 20, "top": 52, "height": "61%"},
+            {"left": 58, "right": 20, "top": "78%", "height": "14%"},
+        ],
+        "xAxis": [
+            {
+                "type": "category",
+                "data": labels,
+                "boundaryGap": True,
+                "axisLine": {"lineStyle": {"color": "#334155"}},
+                "axisLabel": {"color": "#64748b", "hideOverlap": True},
+                "splitLine": {"show": False},
+            },
+            {
+                "type": "category",
+                "gridIndex": 1,
+                "data": labels,
+                "boundaryGap": True,
+                "axisLine": {"lineStyle": {"color": "#334155"}},
+                "axisLabel": {"show": False},
+                "splitLine": {"show": False},
+            },
+        ],
+        "yAxis": [
+            {
+                "scale": True,
+                "axisLabel": {"color": "#64748b"},
+                "splitLine": {"lineStyle": {"color": "rgba(100,116,139,.13)"}},
+            },
+            {
+                "scale": True,
+                "gridIndex": 1,
+                "axisLabel": {"color": "#64748b"},
+                "splitLine": {"show": False},
+            },
+        ],
+        "dataZoom": [
+            {"type": "inside", "xAxisIndex": [0, 1], "start": 35, "end": 100},
+            {
+                "type": "slider",
+                "xAxisIndex": [0, 1],
+                "bottom": 8,
+                "height": 18,
+                "borderColor": "transparent",
+                "backgroundColor": "rgba(15,23,42,.2)",
+                "fillerColor": "rgba(59,130,246,.15)",
+            },
+        ],
+        "series": series,
+    }

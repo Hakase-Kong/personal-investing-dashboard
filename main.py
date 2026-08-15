@@ -8,17 +8,27 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from nicegui import app, ui
 
-from chart_data import get_chart_figure
-from indicator_data import make_indicator_figure, MARKET_LABELS, MACRO_LABELS
+from chart_data import get_echart_options
+from indicator_data import make_indicator_options, MARKET_LABELS, MACRO_LABELS
 from dashboard_data import (
     get_macro_overview,
     get_market_overview,
     get_watchlist_news,
+    get_sparkline_svg,
 )
 from kis import KISClient
 from kr_master import load_master
 from market_data import get_us_quote, search_stocks
 from public_data import get_representative_stocks
+from portfolio_lab import (
+    compare_rebalance_strategies,
+    contribution_rebalance,
+    drift_analysis,
+    drift_timeline,
+    stress_tests,
+    what_if,
+    xray,
+)
 from supabase_store import (
     add_watchlist,
     delete_watchlist,
@@ -28,6 +38,10 @@ from supabase_store import (
     load_portfolio,
     upsert_position,
     delete_position,
+    load_target_allocations,
+    upsert_target_allocation,
+    get_rebalance_rule,
+    upsert_rebalance_rule,
     sign_in,
     sign_out,
     sign_up,
@@ -949,45 +963,52 @@ async def personal_dashboard():
 
     with ui.row().classes("w-full items-center justify-between"):
         ui.button(
-            "시장 홈",
-            icon="public",
-            on_click=lambda: ui.navigate.to("/"),
+            "시장 홈", icon="public", on_click=lambda: ui.navigate.to("/")
         ).props("flat no-caps")
         with ui.row().classes("items-center gap-2"):
             theme_menu(set_theme)
             account_host = ui.row()
 
-    ui.label("PERSONAL DASHBOARD").classes(
+    ui.label("PERSONAL INVESTMENT DASHBOARD").classes(
         "text-[11px] tracking-[.18em] font-bold muted mt-5"
     )
-    ui.label("MY MARKET").classes(
-        "text-4xl font-black main-text"
-    )
+    ui.label("MY MARKET").classes("text-4xl font-black main-text")
 
-    stats = ui.grid(columns=3).classes(
-        "w-full gap-3 mt-7 max-md:grid-cols-1"
-    )
+    summary_host = ui.column().classes("w-full mt-7")
+    market_host = ui.column().classes("w-full mt-9")
     search_host = ui.column().classes("w-full mt-9")
     watch_host = ui.column().classes("w-full mt-9")
     portfolio_host = ui.column().classes("w-full mt-10")
+    lab_host = ui.column().classes("w-full mt-10")
     macro_host = ui.column().classes("w-full mt-10")
     news_host = ui.column().classes("w-full mt-10")
 
     await ui.context.client.connected()
 
     try:
-        user, profile, watchlist, portfolio, macro = await asyncio.gather(
+        (
+            user,
+            profile,
+            watchlist,
+            portfolio,
+            macro,
+            targets,
+            rebalance_rule,
+            market_snapshot,
+        ) = await asyncio.gather(
             asyncio.to_thread(get_user, app.storage.user),
             asyncio.to_thread(get_profile, app.storage.user),
             asyncio.to_thread(load_watchlist, app.storage.user),
             asyncio.to_thread(load_portfolio, app.storage.user),
             asyncio.to_thread(get_macro_overview),
+            asyncio.to_thread(load_target_allocations, app.storage.user),
+            asyncio.to_thread(get_rebalance_rule, app.storage.user),
+            asyncio.to_thread(get_market_overview),
         )
         if not user:
             raise RuntimeError("사용자 확인 실패")
-    except Exception:
-        clear_session()
-        ui.navigate.to("/login")
+    except Exception as exc:
+        ui.notify(f"개인 데이터 로딩 실패: {exc}", type="negative")
         return
 
     display_name = (
@@ -1005,73 +1026,169 @@ async def personal_dashboard():
         ui.navigate.to("/")
 
     with account_host:
-        with ui.button(
-            display_name,
-            icon="account_circle",
-        ).props("flat no-caps"):
+        with ui.button(display_name, icon="account_circle").props("flat no-caps"):
             with ui.menu():
-                ui.menu_item(
-                    "시장 홈",
-                    lambda: ui.navigate.to("/"),
-                )
+                ui.menu_item("시장 홈", lambda: ui.navigate.to("/"))
                 ui.menu_item("로그아웃", logout)
 
-    with stats:
-        for label, value, note in [
-            ("ACCOUNT", display_name, "Supabase Auth"),
-            (
-                "KIS",
-                "CONNECTED" if kis.enabled() else "NOT CONFIGURED",
-                "한국주식 시세",
-            ),
-            ("WATCHLIST", str(len(watchlist)), "내 관심종목"),
-        ]:
-            with ui.card().classes("surface p-5"):
-                ui.label(label).classes(
-                    "text-xs font-bold muted"
+    usdkrw = next(
+        (x.get("value") for x in market_snapshot if x.get("symbol") == "KRW=X"),
+        None,
+    ) or 1.0
+
+    async def valued_positions():
+        async def one(position):
+            try:
+                quote_data = (
+                    await asyncio.to_thread(kis.get_domestic_quote, position["symbol"])
+                    if position["market"] == "KR"
+                    else await asyncio.to_thread(get_us_quote, position["symbol"])
                 )
-                ui.label(value).classes(
-                    "text-xl font-black main-text mt-2"
-                )
-                ui.label(note).classes("text-xs muted")
+                current = float(quote_data.get("price") or 0)
+            except Exception:
+                current = 0.0
+            qty = float(position.get("quantity") or 0)
+            avg = float(position.get("average_price") or 0)
+            fx = 1.0 if position["market"] == "KR" else float(usdkrw)
+            local_value = current * qty
+            local_cost = avg * qty
+            return {
+                "position": position,
+                "current": current,
+                "local_value": local_value,
+                "local_cost": local_cost,
+                "local_pnl": local_value - local_cost,
+                "fx": fx,
+                "value_krw": local_value * fx,
+                "cost_krw": local_cost * fx,
+            }
+
+        if not portfolio:
+            return []
+        return await asyncio.gather(*(one(p) for p in portfolio))
+
+    valuation_rows = await valued_positions()
+
+    def valuation_totals(rows):
+        value = sum(r["value_krw"] for r in rows)
+        cost = sum(r["cost_krw"] for r in rows)
+        pnl = value - cost
+        rate = pnl / cost * 100 if cost else 0.0
+        return value, cost, pnl, rate
+
+    async def render_summary():
+        summary_host.clear()
+        value, cost, pnl, rate = valuation_totals(valuation_rows)
+        with summary_host:
+            with ui.grid(columns=4).classes(
+                "w-full gap-3 max-lg:grid-cols-2 max-md:grid-cols-1"
+            ):
+                cards = [
+                    ("총 평가자산", f"₩{value:,.0f}", "KRW 환산"),
+                    ("투자원금", f"₩{cost:,.0f}", "저장된 평단 기준"),
+                    ("평가손익", f"{pnl:+,.0f}원", f"{rate:+.2f}%"),
+                    ("관심종목", str(len(watchlist)), f"포트폴리오 {len(portfolio)}종목"),
+                ]
+                for title, primary, secondary in cards:
+                    with ui.card().classes("surface p-5"):
+                        ui.label(title).classes("text-xs font-bold muted")
+                        ui.label(primary).classes("text-2xl font-black main-text mt-2")
+                        ui.label(secondary).classes("text-xs muted")
+
+    await render_summary()
+
+    # Same market context as the public home: login should add information, not remove it.
+    with market_host:
+        with ui.row().classes("w-full items-end justify-between"):
+            with ui.column().classes("gap-0"):
+                ui.label("시장 한눈에 보기").classes("section-title")
+                ui.label("로그인 전 시장 화면을 개인 대시보드에서도 그대로 봅니다.").classes("text-xs muted")
+        with ui.grid(columns=7).classes(
+            "w-full gap-2 mt-3 max-xl:grid-cols-4 max-md:grid-cols-2"
+        ):
+            for item in market_snapshot:
+                with ui.card().classes("surface market-card p-4 min-h-[140px]") as card:
+                    async def open_indicator(current=item):
+                        ui.navigate.to(f"/indicator/market/{quote(current['symbol'], safe='')}")
+                    card.on("click", open_indicator)
+                    ui.label(item["name"]).classes("text-xs font-bold muted")
+                    ui.label(market_value_text(item)).classes("text-lg font-black main-text")
+                    pct = item.get("percent")
+                    ui.label("-" if pct is None else f"{pct:+.2f}%").classes(
+                        f"text-xs font-bold {delta_class(pct)}"
+                    )
+                    svg = mini_svg(item.get("spark") or [], height=40)
+                    if svg:
+                        ui.html(svg).classes("w-full mt-2")
 
     with search_host:
         ui.label("종목 검색").classes("section-title")
         search = ui.input(
-            placeholder="삼성, 005930, NVDA, NVIDIA, AAPL"
-        ).props("outlined clearable").classes(
-            "w-full search-box mt-2"
-        )
+            placeholder="삼성, 한화, 005930, NVDA, NVIDIA, AAPL"
+        ).props("outlined clearable").classes("w-full search-box mt-2")
         results = ui.column().classes("w-full gap-2 mt-1")
+
+    search_generation = {"n": 0}
+
+    async def do_search():
+        search_generation["n"] += 1
+        generation = search_generation["n"]
+        query = (search.value or "").strip()
+        results.clear()
+        if not query:
+            return
+        found = await asyncio.to_thread(search_stocks, query)
+        if generation != search_generation["n"]:
+            return
+        with results:
+            for item in found[:10]:
+                with ui.card().classes("w-full surface px-4 py-3"):
+                    with ui.row().classes("w-full items-center justify-between"):
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(item["name"]).classes("font-bold main-text")
+                            ui.label(
+                                f"{item['symbol']} · {item['exchange']} · {item['market']}"
+                            ).classes("text-xs muted")
+
+                        async def add(current=item):
+                            saved = await asyncio.to_thread(
+                                add_watchlist, app.storage.user, current
+                            )
+                            if not any(
+                                x["market"] == current["market"]
+                                and x["exchange"] == current["exchange"]
+                                and x["symbol"] == current["symbol"]
+                                for x in watchlist
+                            ):
+                                watchlist.append(saved or current)
+                            search.set_value("")
+                            results.clear()
+                            await render_watchlist()
+
+                        ui.button("관심종목", icon="star", on_click=add).props(
+                            "flat dense no-caps"
+                        )
+
+    search.on(
+        "update:model-value",
+        lambda _: do_search(),
+        throttle=0.28,
+        leading_events=False,
+        trailing_events=True,
+    )
 
     with watch_host:
         ui.label("내 관심종목").classes("section-title")
+        ui.label("카드 전체 클릭을 제거해 버튼 오작동을 막았습니다.").classes("text-xs muted")
         watch_grid = ui.grid(columns=3).classes(
             "w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1"
         )
 
-
-    with portfolio_host:
-        with ui.row().classes("w-full items-end justify-between"):
-            with ui.column().classes("gap-0"):
-                ui.label("내 포트폴리오").classes("section-title")
-                ui.label(
-                    "수량과 평단을 저장하면 현재가 기준 평가손익을 계산합니다."
-                ).classes("text-xs muted")
-            portfolio_summary = ui.label("").classes(
-                "text-sm font-bold main-text"
-            )
-        portfolio_grid = ui.grid(columns=3).classes(
-            "w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1"
-        )
+    quote_refs = {}
 
     async def edit_position(item, existing=None):
-        with ui.dialog() as dialog, ui.card().classes(
-            "surface w-full max-w-md p-6"
-        ):
-            ui.label(f"{item['name']} 포트폴리오").classes(
-                "text-xl font-black main-text"
-            )
+        with ui.dialog() as dialog, ui.card().classes("surface w-full max-w-md p-6"):
+            ui.label(f"{item['name']} 포트폴리오").classes("text-xl font-black main-text")
             qty = ui.number(
                 "보유수량",
                 value=float((existing or {}).get("quantity") or 0),
@@ -1086,144 +1203,68 @@ async def personal_dashboard():
             ).props("outlined").classes("w-full")
 
             async def save():
-                try:
-                    saved = await asyncio.to_thread(
-                        upsert_position,
-                        app.storage.user,
-                        item,
-                        qty.value or 0,
-                        avg.value or 0,
-                    )
-                    idx = next((i for i,x in enumerate(portfolio)
-                                if x["market"]==item["market"]
-                                and x["exchange"]==item["exchange"]
-                                and x["symbol"]==item["symbol"]), None)
-                    if idx is None:
-                        portfolio.append(saved)
-                    else:
-                        portfolio[idx] = saved
-                    dialog.close()
-                    await render_portfolio()
-                except Exception as exc:
-                    ui.notify(f"포트폴리오 저장 실패: {exc}", type="negative")
+                nonlocal valuation_rows
+                saved = await asyncio.to_thread(
+                    upsert_position,
+                    app.storage.user,
+                    item,
+                    qty.value or 0,
+                    avg.value or 0,
+                )
+                index = next(
+                    (
+                        i for i, p in enumerate(portfolio)
+                        if p["market"] == item["market"]
+                        and p["exchange"] == item["exchange"]
+                        and p["symbol"] == item["symbol"]
+                    ),
+                    None,
+                )
+                if index is None:
+                    portfolio.append(saved)
+                else:
+                    portfolio[index] = saved
+                dialog.close()
+                valuation_rows = await valued_positions()
+                await render_summary()
+                await render_watchlist()
+                await render_portfolio()
+                await render_lab()
 
             with ui.row().classes("w-full justify-end gap-2 mt-3"):
                 ui.button("취소", on_click=dialog.close).props("flat no-caps")
                 ui.button("저장", on_click=save).props("unelevated no-caps").classes("primary")
         dialog.open()
 
-    async def render_portfolio():
-        portfolio_grid.clear()
-        if not portfolio:
-            portfolio_summary.set_text("등록된 포지션 없음")
-            with portfolio_grid:
-                with ui.card().classes("surface p-7"):
-                    ui.label("관심종목 카드에서 포트폴리오에 추가할 수 있습니다.").classes("muted")
-            return
-
-        market_data = await asyncio.to_thread(get_market_overview)
-        usdkrw = next((x.get("value") for x in market_data if x.get("symbol")=="KRW=X"), None) or 1.0
-
-        async def value_position(position):
-            try:
-                q = (await asyncio.to_thread(kis.get_domestic_quote, position["symbol"])
-                     if position["market"]=="KR"
-                     else await asyncio.to_thread(get_us_quote, position["symbol"]))
-                current=float(q.get("price") or 0)
-            except Exception:
-                current=0.0
-            qty=float(position.get("quantity") or 0)
-            avg=float(position.get("average_price") or 0)
-            value=current*qty; cost=avg*qty; pnl=value-cost
-            rate=(pnl/cost*100) if cost else 0.0
-            fx=1.0 if position["market"]=="KR" else float(usdkrw)
-            return {"p":position,"current":current,"value":value,"cost":cost,"pnl":pnl,"rate":rate,"fx":fx}
-
-        rows=await asyncio.gather(*(value_position(p) for p in portfolio))
-        total=sum(x["value"]*x["fx"] for x in rows)
-        cost=sum(x["cost"]*x["fx"] for x in rows)
-        pnl=total-cost; rate=(pnl/cost*100) if cost else 0
-        portfolio_summary.set_text(f"총 평가 ₩{total:,.0f} · 손익 {pnl:+,.0f}원 ({rate:+.2f}%)")
-
-        with portfolio_grid:
-            for row in rows:
-                pos=row["p"]
-                with ui.card().classes("surface p-5"):
-                    ui.label(pos["name"]).classes("text-lg font-bold main-text")
-                    ui.label(f"{pos['symbol']} · {pos['exchange']}").classes("text-xs muted")
-                    ui.label(f"수량 {float(pos['quantity']):,.2f}").classes("text-sm muted mt-3")
-                    if pos["market"]=="KR":
-                        ui.label(f"평단 {float(pos['average_price']):,.0f}원").classes("text-sm muted")
-                        ui.label(f"현재 {row['current']:,.0f}원").classes("text-xl font-black main-text mt-2")
-                        ui.label(f"평가손익 {row['pnl']:+,.0f}원 ({row['rate']:+.2f}%)").classes(f"text-sm font-bold {delta_class(row['pnl'])}")
-                    else:
-                        ui.label(f"평단 ${float(pos['average_price']):,.2f}").classes("text-sm muted")
-                        ui.label(f"현재 ${row['current']:,.2f}").classes("text-xl font-black main-text mt-2")
-                        ui.label(f"평가손익 ${row['pnl']:+,.2f} ({row['rate']:+.2f}%)").classes(f"text-sm font-bold {delta_class(row['pnl'])}")
-
-                    with ui.row().classes("w-full justify-between mt-3"):
-                        ui.button(
-                            "수정",
-                            on_click=lambda current=pos: edit_position(
-                                {"symbol":current["symbol"],"name":current["name"],"market":current["market"],"exchange":current["exchange"]},
-                                current,
-                            ),
-                        ).props("flat dense no-caps")
-
-                        async def remove_position(current=pos):
-                            await asyncio.to_thread(delete_position, app.storage.user, current["market"], current["exchange"], current["symbol"])
-                            portfolio[:] = [x for x in portfolio if not (x["market"]==current["market"] and x["exchange"]==current["exchange"] and x["symbol"]==current["symbol"])]
-                            await render_portfolio()
-
-                        ui.button("삭제", on_click=remove_position).props("flat dense no-caps")
-
-    await render_portfolio()
-
-    quote_refs = {}
-
-    async def refresh_quotes():
-        jobs = []
-
+    async def refresh_watch_quotes():
         async def one(refs):
             item = refs["item"]
             try:
                 q = (
-                    await asyncio.to_thread(
-                        kis.get_domestic_quote,
-                        item["symbol"],
-                    )
+                    await asyncio.to_thread(kis.get_domestic_quote, item["symbol"])
                     if item["market"] == "KR"
-                    else await asyncio.to_thread(
-                        get_us_quote,
-                        item["symbol"],
-                    )
+                    else await asyncio.to_thread(get_us_quote, item["symbol"])
                 )
-                p = q.get("price")
-                ch = q.get("change")
+                price = q.get("price")
+                change = q.get("change")
                 pct = q.get("change_percent")
                 if q.get("currency") == "KRW":
-                    refs["price"].set_text(
-                        "-" if p is None else f"{p:,.0f}원"
-                    )
+                    refs["price"].set_text("-" if price is None else f"{price:,.0f}원")
                     refs["change"].set_text(
-                        "-" if ch is None or pct is None
-                        else f"{ch:+,.0f}원 ({pct:+.2f}%)"
+                        "-" if change is None or pct is None
+                        else f"{change:+,.0f}원 ({pct:+.2f}%)"
                     )
                 else:
-                    refs["price"].set_text(
-                        "-" if p is None else f"${p:,.2f}"
-                    )
+                    refs["price"].set_text("-" if price is None else f"${price:,.2f}")
                     refs["change"].set_text(
-                        "-" if ch is None or pct is None
-                        else f"${ch:+,.2f} ({pct:+.2f}%)"
+                        "-" if change is None or pct is None
+                        else f"${change:+,.2f} ({pct:+.2f}%)"
                     )
             except Exception:
                 refs["price"].set_text("조회 실패")
 
-        for refs in quote_refs.values():
-            jobs.append(one(refs))
-        if jobs:
-            await asyncio.gather(*jobs)
+        if quote_refs:
+            await asyncio.gather(*(one(x) for x in quote_refs.values()))
 
     async def render_watchlist():
         watch_grid.clear()
@@ -1231,59 +1272,64 @@ async def personal_dashboard():
         with watch_grid:
             if not watchlist:
                 with ui.card().classes("surface p-7"):
-                    ui.label(
-                        "아직 저장한 관심종목이 없습니다."
-                    ).classes("font-bold main-text")
-                    ui.label(
-                        "위 검색창에서 종목을 추가해보세요."
-                    ).classes("text-sm muted")
+                    ui.label("아직 저장한 관심종목이 없습니다.").classes("font-bold main-text")
                 return
 
             for item in watchlist:
-                with ui.card().classes(
-                    "surface stock-card p-5 min-h-[245px]"
-                ) as card:
-                    card.on(
-                        "click",
-                        lambda _, x=item: ui.navigate.to(
-                            f"/stock/{x['market']}/"
-                            f"{quote(x['exchange'], safe='')}/"
-                            f"{quote(x['symbol'], safe='')}"
-                        ),
-                    )
-                    ui.label(item["name"]).classes(
-                        "text-lg font-bold main-text"
-                    )
-                    ui.label(
-                        f"{item['symbol']} · {item['exchange']}"
-                    ).classes("text-xs muted")
-                    price = ui.label(
-                        "불러오는 중..."
-                    ).classes(
-                        "text-2xl font-black main-text mt-4"
-                    )
-                    change = ui.label("-").classes(
-                        "text-sm font-bold muted"
-                    )
+                with ui.card().classes("surface p-5 min-h-[310px]"):
+                    with ui.row().classes("w-full items-start justify-between"):
+                        with ui.column().classes("gap-0"):
+                            ui.label(item["name"]).classes("text-lg font-bold main-text")
+                            ui.label(f"{item['symbol']} · {item['exchange']}").classes("text-xs muted")
+                        ui.label(item["market"]).classes("pill text-[10px] font-bold")
 
-                    existing_position = next(
-                        (p for p in portfolio
-                         if p["market"]==item["market"]
-                         and p["exchange"]==item["exchange"]
-                         and p["symbol"]==item["symbol"]),
+                    price = ui.label("불러오는 중...").classes("text-2xl font-black main-text mt-4")
+                    change = ui.label("-").classes("text-sm font-bold muted")
+                    spark_host = ui.column().classes("w-full h-[74px] mt-3")
+
+                    async def load_spark(current=item, host=spark_host):
+                        svg = await asyncio.to_thread(
+                            get_sparkline_svg,
+                            current["market"],
+                            current["exchange"],
+                            current["symbol"],
+                        )
+                        host.clear()
+                        with host:
+                            if svg:
+                                ui.html(svg).classes("w-full")
+
+                    asyncio.create_task(load_spark())
+
+                    existing = next(
+                        (
+                            p for p in portfolio
+                            if p["market"] == item["market"]
+                            and p["exchange"] == item["exchange"]
+                            and p["symbol"] == item["symbol"]
+                        ),
                         None,
                     )
-                    ui.button(
-                        "포트폴리오 편집",
-                        icon="account_balance_wallet",
-                        on_click=lambda _, current=item, existing=existing_position: edit_position(current, existing),
-                    ).props("flat dense no-caps").classes("mt-3")
 
-                    async def remove(event, current=item):
-                        try:
-                            event.stop_propagation()
-                        except Exception:
-                            pass
+                    with ui.row().classes("w-full gap-2 mt-3"):
+                        async def detail(current=item):
+                            ui.navigate.to(
+                                f"/stock/{current['market']}/"
+                                f"{quote(current['exchange'], safe='')}/"
+                                f"{quote(current['symbol'], safe='')}"
+                            )
+
+                        async def portfolio_edit(current=item, current_position=existing):
+                            await edit_position(current, current_position)
+
+                        ui.button("상세차트", icon="show_chart", on_click=detail).props(
+                            "outline dense no-caps"
+                        ).classes("flex-1")
+                        ui.button(
+                            "포트폴리오", icon="account_balance_wallet", on_click=portfolio_edit
+                        ).props("outline dense no-caps").classes("flex-1")
+
+                    async def remove(current=item):
                         await asyncio.to_thread(
                             delete_watchlist,
                             app.storage.user,
@@ -1301,10 +1347,9 @@ async def personal_dashboard():
                         ]
                         await render_watchlist()
 
-                    ui.button(
-                        "삭제",
-                        on_click=remove,
-                    ).props("flat dense").classes("w-full mt-4")
+                    ui.button("관심종목 삭제", on_click=remove).props(
+                        "flat dense no-caps"
+                    ).classes("w-full mt-2 muted")
 
                     quote_refs[item["symbol"]] = {
                         "item": item,
@@ -1312,217 +1357,539 @@ async def personal_dashboard():
                         "change": change,
                     }
 
-        await refresh_quotes()
-
-    search_generation = {"n": 0}
-
-    async def do_personal_search():
-        search_generation["n"] += 1
-        n = search_generation["n"]
-        q = (search.value or "").strip()
-        results.clear()
-        if not q:
-            return
-
-        found = await asyncio.to_thread(search_stocks, q)
-        if n != search_generation["n"]:
-            return
-
-        with results:
-            for item in found[:8]:
-                with ui.card().classes(
-                    "w-full surface px-4 py-3"
-                ):
-                    with ui.row().classes(
-                        "w-full items-center justify-between"
-                    ):
-                        with ui.column().classes("gap-0"):
-                            ui.label(item["name"]).classes(
-                                "font-bold main-text"
-                            )
-                            ui.label(
-                                f"{item['symbol']} · {item['exchange']} · {item['market']}"
-                            ).classes("text-xs muted")
-
-                        async def add(current=item):
-                            saved = await asyncio.to_thread(
-                                add_watchlist,
-                                app.storage.user,
-                                current,
-                            )
-                            exists = any(
-                                x["market"] == current["market"]
-                                and x["exchange"] == current["exchange"]
-                                and x["symbol"] == current["symbol"]
-                                for x in watchlist
-                            )
-                            if not exists:
-                                watchlist.append(saved or current)
-                            search.set_value("")
-                            results.clear()
-                            await render_watchlist()
-
-                        ui.button(
-                            "추가",
-                            icon="add",
-                            on_click=add,
-                        ).props("unelevated").classes("primary")
-
-    search.on(
-        "update:model-value",
-        lambda _: do_personal_search(),
-        throttle=0.28,
-        leading_events=False,
-        trailing_events=True,
-    )
+        await refresh_watch_quotes()
 
     await render_watchlist()
-    ui.timer(REFRESH_SECONDS, refresh_quotes)
+    ui.timer(REFRESH_SECONDS, refresh_watch_quotes)
+
+    with portfolio_host:
+        with ui.row().classes("w-full items-end justify-between"):
+            with ui.column().classes("gap-0"):
+                ui.label("내 포트폴리오").classes("section-title")
+                ui.label("현재가·평단·환율을 합쳐 평가손익과 자산배분을 계산합니다.").classes("text-xs muted")
+            portfolio_summary = ui.label("").classes("text-sm font-bold main-text")
+        with ui.grid(columns=3).classes(
+            "w-full gap-3 mt-3 max-lg:grid-cols-1"
+        ):
+            portfolio_grid = ui.grid(columns=2).classes("col-span-2 gap-3 max-md:grid-cols-1")
+            allocation_host = ui.column().classes("surface p-4 min-h-[300px]")
+
+    async def render_portfolio():
+        portfolio_grid.clear()
+        allocation_host.clear()
+        value, cost, pnl, rate = valuation_totals(valuation_rows)
+        portfolio_summary.set_text(
+            f"총 평가 ₩{value:,.0f} · {pnl:+,.0f}원 ({rate:+.2f}%)"
+        )
+
+        with portfolio_grid:
+            if not valuation_rows:
+                with ui.card().classes("surface p-7"):
+                    ui.label("관심종목의 포트폴리오 버튼에서 수량·평단을 입력하세요.").classes("muted")
+            for row in valuation_rows:
+                p = row["position"]
+                local_rate = row["local_pnl"] / row["local_cost"] * 100 if row["local_cost"] else 0
+                with ui.card().classes("surface p-5"):
+                    ui.label(p["name"]).classes("text-lg font-bold main-text")
+                    ui.label(f"{p['symbol']} · {p['exchange']}").classes("text-xs muted")
+                    ui.label(f"수량 {float(p['quantity']):,.2f}").classes("text-sm muted mt-3")
+                    if p["market"] == "KR":
+                        ui.label(f"현재 {row['current']:,.0f}원").classes("text-xl font-black main-text")
+                        ui.label(
+                            f"손익 {row['local_pnl']:+,.0f}원 ({local_rate:+.2f}%)"
+                        ).classes(f"text-sm font-bold {delta_class(row['local_pnl'])}")
+                    else:
+                        ui.label(f"현재 ${row['current']:,.2f}").classes("text-xl font-black main-text")
+                        ui.label(
+                            f"손익 ${row['local_pnl']:+,.2f} ({local_rate:+.2f}%)"
+                        ).classes(f"text-sm font-bold {delta_class(row['local_pnl'])}")
+
+                    item = {
+                        "symbol": p["symbol"], "name": p["name"],
+                        "market": p["market"], "exchange": p["exchange"],
+                    }
+                    ui.button("수량·평단 수정", on_click=lambda current=item, existing=p: edit_position(current, existing)).props(
+                        "flat dense no-caps"
+                    ).classes("mt-2")
+
+        with allocation_host:
+            ui.label("자산 배분").classes("font-bold main-text")
+            if valuation_rows and value > 0:
+                data = [
+                    {
+                        "name": r["position"]["name"],
+                        "value": round(r["value_krw"], 2),
+                    }
+                    for r in valuation_rows
+                    if r["value_krw"] > 0
+                ]
+                ui.echart({
+                    "animation": False,
+                    "tooltip": {"trigger": "item"},
+                    "legend": {"bottom": 0, "textStyle": {"color": "#64748b"}},
+                    "series": [{
+                        "type": "pie",
+                        "radius": ["48%", "72%"],
+                        "center": ["50%", "43%"],
+                        "label": {"show": False},
+                        "data": data,
+                    }],
+                }).classes("w-full h-[260px]")
+            else:
+                ui.label("포지션을 등록하면 구성비가 표시됩니다.").classes("muted mt-4")
+
+    await render_portfolio()
+
+    with lab_host:
+        ui.label("PORTFOLIO LAB").classes("section-title")
+        ui.label(
+            "목표비중, 드리프트, 매도 없는 리밸런싱, 백테스트, X-Ray, What-if, Stress Test"
+        ).classes("text-xs muted")
+        lab_content = ui.column().classes("w-full mt-3")
+
+    async def save_all_targets(mode):
+        nonlocal targets
+        if not valuation_rows:
+            return
+        total_value = sum(r["value_krw"] for r in valuation_rows)
+        count = len(valuation_rows)
+        saved = []
+        for row in valuation_rows:
+            item = row["position"]
+            if mode == "equal":
+                weight = 100 / count if count else 0
+            else:
+                weight = row["value_krw"] / total_value * 100 if total_value else 0
+            saved.append(
+                await asyncio.to_thread(
+                    upsert_target_allocation,
+                    app.storage.user,
+                    item,
+                    weight,
+                )
+            )
+        targets[:] = saved
+        await render_lab()
+
+    async def render_lab():
+        lab_content.clear()
+        with lab_content:
+            if not valuation_rows:
+                with ui.card().classes("surface p-7"):
+                    ui.label("Portfolio Lab은 포트폴리오 포지션을 등록한 뒤 사용할 수 있습니다.").classes("muted")
+                return
+
+            current_values = {
+                (r["position"]["market"], r["position"]["exchange"], r["position"]["symbol"]): r["value_krw"]
+                for r in valuation_rows
+            }
+            drift_rows, drift_score = drift_analysis(portfolio, targets, current_values)
+            target_sum = sum(float(t.get("target_weight") or 0) for t in targets)
+            threshold_pct = float(rebalance_rule.get("threshold_pct") or 5)
+            alerts = [r for r in drift_rows if abs(r["drift"] * 100) >= threshold_pct]
+
+            if rebalance_rule.get("enabled", True) and alerts:
+                with ui.card().classes("surface p-4 w-full border-l-4 border-orange-400"):
+                    ui.label(f"리밸런싱 알림 · {len(alerts)}개 종목이 ±{threshold_pct:.1f}%p 범위를 벗어났습니다.").classes(
+                        "font-bold main-text"
+                    )
+                    ui.label(
+                        " · ".join(f"{r['name']} {r['drift']*100:+.1f}%p" for r in alerts[:4])
+                    ).classes("text-xs muted")
+
+            with ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1"):
+                for label, value, note in [
+                    ("Rebalance Need", f"{drift_score:.0f}/100", "높을수록 목표에서 멀어짐"),
+                    ("목표비중 합계", f"{target_sum:.1f}%", "100% 권장"),
+                    ("허용 Drift", f"±{threshold_pct:.1f}%p", "초과 시 인앱 알림"),
+                    ("Portfolio X-Ray", "분석 가능", "집중도·상관관계"),
+                ]:
+                    with ui.card().classes("surface p-4"):
+                        ui.label(label).classes("text-xs font-bold muted")
+                        ui.label(value).classes("text-xl font-black main-text mt-1")
+                        ui.label(note).classes("text-xs muted")
+
+            with ui.row().classes("w-full gap-2 mt-4"):
+                ui.button("현재비중을 목표로", on_click=lambda: save_all_targets("current")).props("outline no-caps")
+                ui.button("균등 1/N 목표", on_click=lambda: save_all_targets("equal")).props("outline no-caps")
+
+            ui.label("목표 비중 & Drift").classes("font-bold main-text mt-5")
+            with ui.grid(columns=2).classes("w-full gap-3 mt-2 max-md:grid-cols-1"):
+                target_map = {
+                    (t["market"], t["exchange"], t["symbol"]): t
+                    for t in targets
+                }
+                for row in drift_rows:
+                    target = target_map.get(row["key"])
+                    with ui.card().classes("surface p-4"):
+                        with ui.row().classes("w-full justify-between"):
+                            ui.label(row["name"]).classes("font-bold main-text")
+                            ui.label(f"Drift {row['drift']*100:+.1f}%p").classes(
+                                f"text-sm font-bold {delta_class(-abs(row['drift'])) if abs(row['drift']) > .05 else 'muted'}"
+                            )
+                        ui.label(
+                            f"현재 {row['current_weight']*100:.1f}% · 목표 {row['target_weight']*100:.1f}%"
+                        ).classes("text-sm muted")
+                        ui.label(
+                            ("매수 " if row["trade_amount"] >= 0 else "매도 ")
+                            + f"₩{abs(row['trade_amount']):,.0f}"
+                        ).classes("text-sm main-text mt-1")
+
+                        weight_input = ui.number(
+                            "목표 %",
+                            value=float((target or {}).get("target_weight") or 0),
+                            min=0,
+                            max=100,
+                            step=0.5,
+                        ).props("outlined dense").classes("w-32 mt-2")
+
+                        async def save_target(current=row, field=weight_input):
+                            nonlocal targets
+                            item = next(
+                                p for p in portfolio
+                                if (p["market"], p["exchange"], p["symbol"]) == current["key"]
+                            )
+                            saved = await asyncio.to_thread(
+                                upsert_target_allocation,
+                                app.storage.user,
+                                item,
+                                field.value or 0,
+                            )
+                            index = next(
+                                (
+                                    i for i, t in enumerate(targets)
+                                    if (t["market"], t["exchange"], t["symbol"]) == current["key"]
+                                ),
+                                None,
+                            )
+                            if index is None:
+                                targets.append(saved)
+                            else:
+                                targets[index] = saved
+                            await render_lab()
+
+                        ui.button("저장", on_click=save_target).props("flat dense no-caps")
+
+            with ui.card().classes("surface p-5 w-full mt-4"):
+                ui.label("리밸런싱 알림 기준").classes("font-bold main-text")
+                with ui.row().classes("items-end gap-3 mt-2"):
+                    threshold = ui.number(
+                        "허용 Drift (%p)",
+                        value=threshold_pct,
+                        min=1,
+                        max=50,
+                        step=0.5,
+                    ).props("outlined dense").classes("w-40")
+                    enabled = ui.switch(
+                        "인앱 알림",
+                        value=bool(rebalance_rule.get("enabled", True)),
+                    )
+
+                    async def save_rule():
+                        saved = await asyncio.to_thread(
+                            upsert_rebalance_rule,
+                            app.storage.user,
+                            threshold.value or 5,
+                            enabled.value,
+                        )
+                        rebalance_rule.update(saved)
+                        await render_lab()
+
+                    ui.button("기준 저장", on_click=save_rule).props("unelevated no-caps").classes("primary")
+
+            with ui.card().classes("surface p-5 w-full mt-4"):
+                ui.label("Smart Rebalance · 매도 없이 균형 맞추기").classes("font-bold main-text")
+                ui.label("추가 투자금을 과소비중 종목에 우선 배분합니다.").classes("text-xs muted")
+                contribution = ui.number(
+                    "추가 투자금 (원)", value=1_000_000, min=0, step=100_000
+                ).props("outlined").classes("w-full max-w-sm mt-3")
+                suggestion_host = ui.column().classes("w-full mt-3")
+
+                async def suggest():
+                    suggestion_host.clear()
+                    suggestions = contribution_rebalance(drift_rows, contribution.value or 0)
+                    with suggestion_host:
+                        if not suggestions:
+                            ui.label("추가 매수로 조정할 과소비중 종목이 없습니다.").classes("muted")
+                        for suggestion in suggestions:
+                            with ui.row().classes("w-full justify-between py-1"):
+                                ui.label(suggestion["name"]).classes("main-text")
+                                ui.label(f"₩{suggestion['contribution_amount']:,.0f} 매수").classes("font-bold main-text")
+
+                ui.button("배분 계산", icon="calculate", on_click=suggest).props("outline no-caps").classes("mt-2")
+
+            target_weights = {
+                t["symbol"]: float(t.get("target_weight") or 0) / 100
+                for t in targets
+                if float(t.get("target_weight") or 0) > 0
+            }
+            if not target_weights:
+                total_current = sum(current_values.values()) or 1
+                target_weights = {
+                    p["symbol"]: current_values.get((p["market"], p["exchange"], p["symbol"]), 0) / total_current
+                    for p in portfolio
+                }
+
+            with ui.card().classes("surface p-5 w-full mt-4"):
+                ui.label("리밸런싱 백테스트").classes("font-bold main-text")
+                ui.label("리밸런싱 없음 / 매월 / 분기 / 연 1회 / ±5%p를 동일 목표비중으로 비교합니다.").classes("text-xs muted")
+                backtest_host = ui.column().classes("w-full mt-3")
+
+                async def run_backtest_ui():
+                    backtest_host.clear()
+                    with backtest_host:
+                        ui.spinner(size="md")
+                    tests = await asyncio.to_thread(
+                        compare_rebalance_strategies,
+                        portfolio,
+                        target_weights,
+                        "5y",
+                    )
+                    backtest_host.clear()
+                    with backtest_host:
+                        with ui.grid(columns=5).classes("w-full gap-2 max-lg:grid-cols-2"):
+                            for test in tests:
+                                m = test["metrics"]
+                                with ui.card().classes("surface p-3"):
+                                    ui.label(test["label"]).classes("text-xs font-bold muted")
+                                    ui.label(f"CAGR {m.cagr*100:.1f}%").classes("font-bold main-text")
+                                    ui.label(f"MDD {m.max_drawdown*100:.1f}%").classes("text-xs muted")
+                                    ui.label(f"Sharpe {m.sharpe:.2f}").classes("text-xs muted")
+                        series = []
+                        dates = []
+                        for test in tests:
+                            if test["dates"] and not dates:
+                                dates = test["dates"]
+                            series.append({
+                                "name": test["label"],
+                                "type": "line",
+                                "data": [round(v * 100, 2) for v in test["equity"]],
+                                "showSymbol": False,
+                                "lineStyle": {"width": 1.6},
+                            })
+                        if dates:
+                            ui.echart({
+                                "animation": False,
+                                "tooltip": {"trigger": "axis"},
+                                "legend": {"top": 0, "textStyle": {"color": "#64748b"}},
+                                "grid": {"left": 55, "right": 18, "top": 45, "bottom": 45},
+                                "xAxis": {"type": "category", "data": dates, "axisLabel": {"hideOverlap": True}},
+                                "yAxis": {"type": "value", "name": "초기 100"},
+                                "dataZoom": [{"type": "inside"}],
+                                "series": series,
+                            }).classes("w-full h-[420px] mt-3")
+
+                ui.button("5년 백테스트 실행", icon="science", on_click=run_backtest_ui).props("outline no-caps").classes("mt-2")
+
+            with ui.card().classes("surface p-5 w-full mt-4"):
+                ui.label("Drift Timeline").classes("font-bold main-text")
+                ui.label("목표비중으로 시작했다고 가정할 때 시간이 지나며 비중이 얼마나 틀어졌는지 봅니다.").classes("text-xs muted")
+                drift_timeline_host = ui.column().classes("w-full mt-2")
+
+                async def run_drift_timeline():
+                    drift_timeline_host.clear()
+                    with drift_timeline_host:
+                        ui.spinner(size="md")
+                    timeline = await asyncio.to_thread(
+                        drift_timeline, portfolio, target_weights, "2y"
+                    )
+                    drift_timeline_host.clear()
+                    with drift_timeline_host:
+                        if not timeline["dates"]:
+                            ui.label("표시할 데이터가 없습니다.").classes("muted")
+                            return
+                        ui.echart({
+                            "animation": False,
+                            "tooltip": {"trigger": "axis"},
+                            "grid": {"left": 55, "right": 18, "top": 20, "bottom": 45},
+                            "xAxis": {"type": "category", "data": timeline["dates"], "axisLabel": {"hideOverlap": True}},
+                            "yAxis": {"type": "value", "name": "Drift %"},
+                            "dataZoom": [{"type": "inside"}],
+                            "series": [{
+                                "type": "line",
+                                "data": timeline["drift"],
+                                "showSymbol": False,
+                                "lineStyle": {"width": 2, "color": "#f59e0b"},
+                                "areaStyle": {"color": "rgba(245,158,11,.10)"},
+                            }],
+                        }).classes("w-full h-[300px]")
+
+                ui.button("2년 Drift 보기", on_click=run_drift_timeline).props("outline no-caps").classes("mt-2")
+
+            with ui.grid(columns=2).classes("w-full gap-4 mt-4 max-lg:grid-cols-1"):
+                with ui.card().classes("surface p-5"):
+                    ui.label("Portfolio X-Ray").classes("font-bold main-text")
+                    ui.label("집중도·유효 종목수·평균 상관관계를 진단합니다.").classes("text-xs muted")
+                    xray_host = ui.column().classes("w-full mt-3")
+
+                    async def run_xray():
+                        xray_host.clear()
+                        with xray_host:
+                            ui.spinner(size="md")
+                        result = await asyncio.to_thread(xray, portfolio, target_weights, "2y")
+                        xray_host.clear()
+                        with xray_host:
+                            ui.label(f"Portfolio Score {result['score']} / 100").classes("text-2xl font-black main-text")
+                            ui.label(f"상위 1종목 {result['top_weight']*100:.1f}% · 유효 종목수 {result['effective_n']:.1f}").classes("text-sm muted")
+                            ui.label(f"평균 상관계수 {result['avg_corr']:.2f}").classes("text-sm muted")
+                            ui.echart({
+                                "animation": False,
+                                "series": [{
+                                    "type": "pie",
+                                    "radius": ["45%", "70%"],
+                                    "data": [
+                                        {"name": "한국", "value": round(result["region"].get("KR", 0)*100, 2)},
+                                        {"name": "미국", "value": round(result["region"].get("US", 0)*100, 2)},
+                                    ],
+                                }],
+                                "legend": {"bottom": 0},
+                            }).classes("w-full h-[220px]")
+
+                    ui.button("X-Ray 실행", on_click=run_xray).props("outline no-caps").classes("mt-2")
+
+                with ui.card().classes("surface p-5"):
+                    ui.label("What-if Simulator").classes("font-bold main-text")
+                    ui.label("한 종목의 목표비중을 바꾸면 과거 위험지표가 어떻게 달라졌는지 봅니다.").classes("text-xs muted")
+                    options = {p["symbol"]: p["name"] for p in portfolio}
+                    selected = ui.select(options=options, value=portfolio[0]["symbol"], label="종목").props("outlined").classes("w-full mt-3")
+                    new_weight = ui.number("새 목표비중 %", value=20, min=0, max=100, step=1).props("outlined").classes("w-full")
+                    whatif_host = ui.column().classes("w-full mt-2")
+
+                    async def run_whatif():
+                        result = await asyncio.to_thread(
+                            what_if,
+                            portfolio,
+                            target_weights,
+                            selected.value,
+                            (new_weight.value or 0) / 100,
+                            "2y",
+                        )
+                        whatif_host.clear()
+                        with whatif_host:
+                            if not result:
+                                ui.label("계산할 수 없습니다.").classes("muted")
+                                return
+                            base = result["base"]
+                            new = result["new"]
+                            ui.label(
+                                f"변동성 {base.volatility*100:.1f}% → {new.volatility*100:.1f}%"
+                            ).classes("font-bold main-text")
+                            ui.label(
+                                f"MDD {base.max_drawdown*100:.1f}% → {new.max_drawdown*100:.1f}%"
+                            ).classes("text-sm muted")
+                            ui.label(
+                                f"Sharpe {base.sharpe:.2f} → {new.sharpe:.2f}"
+                            ).classes("text-sm muted")
+
+                    ui.button("What-if 계산", on_click=run_whatif).props("outline no-caps").classes("mt-2")
+
+            ui.label("Stress Test").classes("font-bold main-text mt-5")
+            with ui.grid(columns=4).classes("w-full gap-3 mt-2 max-md:grid-cols-2"):
+                for scenario in stress_tests(portfolio, target_weights):
+                    with ui.card().classes("surface p-4"):
+                        ui.label(scenario["name"]).classes("text-xs font-bold muted")
+                        ui.label(f"{scenario['shock']*100:.1f}%").classes("text-xl font-black negative mt-1")
+                        current_total = sum(current_values.values())
+                        ui.label(f"약 {current_total*scenario['shock']:+,.0f}원").classes("text-xs muted")
+
+    await render_lab()
 
     with macro_host:
         ui.label("주요 경제지표").classes("section-title")
-        with ui.grid(columns=4).classes(
-            "w-full gap-3 mt-3 max-md:grid-cols-2"
-        ):
+        with ui.grid(columns=4).classes("w-full gap-3 mt-3 max-md:grid-cols-2"):
             for item in macro:
-                with ui.card().classes("surface market-card p-4") as macro_card:
-                    macro_card.on(
-                        "click",
-                        lambda _, x=item: ui.navigate.to(
-                            f"/indicator/macro/{quote(x['id'], safe='')}"
-                        ),
-                    )
-                    ui.label(item["name"]).classes(
-                        "text-xs font-bold muted"
-                    )
+                with ui.card().classes("surface market-card p-4") as card:
+                    async def open_macro(current=item):
+                        ui.navigate.to(f"/indicator/macro/{quote(current['id'], safe='')}")
+                    card.on("click", open_macro)
+                    ui.label(item["name"]).classes("text-xs font-bold muted")
                     ui.label(
-                        "-" if item["value"] is None
-                        else f"{item['value']:.2f}{item['suffix']}"
-                    ).classes(
-                        "text-xl font-black main-text"
-                    )
+                        "-" if item["value"] is None else f"{item['value']:.2f}{item['suffix']}"
+                    ).classes("text-xl font-black main-text")
+                    svg = mini_svg(item.get("spark") or [], height=38)
+                    if svg:
+                        ui.html(svg).classes("w-full mt-2")
 
     with news_host:
         ui.label("내 관심종목 뉴스").classes("section-title")
-        news_list = ui.column().classes(
-            "w-full surface px-5 mt-3"
-        )
+        news_list = ui.column().classes("w-full surface px-5 mt-3")
 
-    async def load_personal_news():
-        data = await asyncio.to_thread(
-            get_watchlist_news,
-            watchlist,
-            8,
-        )
+    async def load_news():
+        data = await asyncio.to_thread(get_watchlist_news, watchlist, 10)
         news_list.clear()
         with news_list:
             if not data:
-                ui.label("표시할 뉴스가 없습니다.").classes(
-                    "py-5 muted"
-                )
+                ui.label("표시할 뉴스가 없습니다.").classes("py-5 muted")
             for item in data:
-                with ui.column().classes(
-                    "w-full py-4 border-b border-[var(--border)] "
-                    "last:border-0 gap-1"
-                ):
+                with ui.column().classes("w-full py-4 border-b border-[var(--border)] last:border-0 gap-1"):
                     if item.get("url"):
-                        ui.link(
-                            item["title"],
-                            item["url"],
-                            new_tab=True,
-                        ).classes(
+                        ui.link(item["title"], item["url"], new_tab=True).classes(
                             "main-text font-semibold no-underline"
                         )
                     else:
-                        ui.label(item["title"]).classes(
-                            "main-text font-semibold"
-                        )
+                        ui.label(item["title"]).classes("main-text font-semibold")
                     ui.label(
                         " · ".join(
-                            x for x in [
-                                item.get("symbol", ""),
-                                item.get("publisher", ""),
-                            ] if x
+                            x for x in [item.get("symbol", ""), item.get("publisher", "")] if x
                         )
                     ).classes("text-xs muted")
 
-    await load_personal_news()
+    asyncio.create_task(load_news())
 
 
 @ui.page(
     "/stock/{market}/{exchange}/{symbol}",
     response_timeout=15,
 )
-async def stock_detail(market, exchange, symbol):
+async def stock_detail(market: str, exchange: str, symbol: str):
     add_style()
     _, set_theme = apply_theme()
 
-    with ui.row().classes(
-        "w-full items-center justify-between sticky top-0 z-10 py-3"
-    ):
+    with ui.row().classes("w-full items-center justify-between sticky top-0 z-10 py-3"):
         ui.button(
-            "이전 화면",
-            icon="arrow_back",
-            on_click=lambda: ui.run_javascript("history.back()"),
+            "이전 화면", icon="arrow_back", on_click=lambda: ui.run_javascript("history.back()")
         ).props("flat no-caps")
         with ui.row().classes("gap-2"):
             theme_menu(set_theme)
-            ui.button(
-                "시장 홈",
-                icon="public",
-                on_click=lambda: ui.navigate.to("/"),
-            ).props("flat no-caps")
+            ui.button("시장 홈", icon="public", on_click=lambda: ui.navigate.to("/")).props("flat no-caps")
             if logged_in():
                 ui.button(
-                    "내 대시보드",
-                    icon="dashboard",
-                    on_click=lambda: ui.navigate.to("/dashboard"),
+                    "내 대시보드", icon="dashboard", on_click=lambda: ui.navigate.to("/dashboard")
                 ).props("flat no-caps")
 
-    name_label = ui.label(symbol).classes(
-        "text-3xl font-black main-text mt-5"
-    )
-    ui.label(
-        f"{symbol} · {exchange} · {market}"
-    ).classes("text-sm muted")
+    name_label = ui.label(symbol).classes("text-3xl font-black main-text mt-5")
+    ui.label(f"{symbol} · {exchange} · {market}").classes("text-sm muted")
 
     with ui.card().classes("surface p-5 mt-5"):
-        price_label = ui.label(
-            "가격 불러오는 중..."
-        ).classes("text-3xl font-black main-text")
-        change_label = ui.label("-").classes(
-            "text-sm font-bold muted"
-        )
+        price_label = ui.label("가격 불러오는 중...").classes("text-3xl font-black main-text")
+        change_label = ui.label("-").classes("text-sm font-bold muted")
 
-    ui.label("차트").classes("section-title mt-8")
-    timeframe = ui.toggle(
-        {"1D":"1일","D":"일봉","W":"주봉","M":"월봉"},
-        value="D",
-    ).props("unelevated").classes("mt-3")
-    ma = ui.select(
-        options={5:"MA5",20:"MA20",60:"MA60",120:"MA120"},
-        value=[5,20,60,120],
-        multiple=True,
-        label="이동평균선",
-    ).props("outlined use-chips").classes(
-        "w-full max-w-xl mt-3"
-    )
-    chart_host = ui.column().classes(
-        "w-full chart-wrap min-h-[560px] mt-4"
-    )
-    with chart_host:
-        ui.spinner(size="lg").classes("m-auto mt-24")
+    with ui.row().classes("w-full items-center gap-3 mt-6"):
+        timeframe = ui.toggle(
+            {"1D": "1일", "D": "일봉", "W": "주봉", "M": "월봉"},
+            value="D",
+        ).props("unelevated")
+        ma = ui.select(
+            options={5: "MA5", 20: "MA20", 60: "MA60", 120: "MA120"},
+            value=[5, 20, 60, 120],
+            multiple=True,
+            label="이동평균선",
+        ).props("outlined use-chips dense").classes("w-full max-w-xl")
+
+    status = ui.label("일봉 차트를 준비하고 있습니다...").classes("text-xs muted mt-2")
+    chart = ui.echart({
+        "animation": False,
+        "xAxis": {"type": "category", "data": []},
+        "yAxis": {"type": "value"},
+        "series": [],
+    }, renderer="canvas").classes("w-full h-[610px] chart-wrap mt-3")
 
     await ui.context.client.connected()
 
     try:
         found = await asyncio.to_thread(search_stocks, symbol)
         exact = next(
-            (
-                x for x in found
-                if x["market"] == market
-                and x["symbol"] == symbol
-            ),
+            (x for x in found if x["market"] == market and x["symbol"] == symbol),
             None,
         )
         if exact:
@@ -1533,53 +1900,35 @@ async def stock_detail(market, exchange, symbol):
     async def load_quote():
         try:
             q = (
-                await asyncio.to_thread(
-                    kis.get_domestic_quote,
-                    symbol,
-                )
+                await asyncio.to_thread(kis.get_domestic_quote, symbol)
                 if market == "KR"
-                else await asyncio.to_thread(
-                    get_us_quote,
-                    symbol,
-                )
+                else await asyncio.to_thread(get_us_quote, symbol)
             )
-            p, c, pct = (
-                q.get("price"),
-                q.get("change"),
-                q.get("change_percent"),
-            )
+            price, change, pct = q.get("price"), q.get("change"), q.get("change_percent")
             if q.get("currency") == "KRW":
-                price_label.set_text(
-                    "-" if p is None else f"{p:,.0f}원"
-                )
+                price_label.set_text("-" if price is None else f"{price:,.0f}원")
                 change_label.set_text(
-                    "-" if c is None or pct is None
-                    else f"{c:+,.0f}원 ({pct:+.2f}%)"
+                    "-" if change is None or pct is None else f"{change:+,.0f}원 ({pct:+.2f}%)"
                 )
             else:
-                price_label.set_text(
-                    "-" if p is None else f"${p:,.2f}"
-                )
+                price_label.set_text("-" if price is None else f"${price:,.2f}")
                 change_label.set_text(
-                    "-" if c is None or pct is None
-                    else f"${c:+,.2f} ({pct:+.2f}%)"
+                    "-" if change is None or pct is None else f"${change:+,.2f} ({pct:+.2f}%)"
                 )
         except Exception as exc:
             price_label.set_text("조회 실패")
-            change_label.set_text(str(exc)[:80])
+            change_label.set_text(str(exc)[:90])
 
-    lock = asyncio.Lock()
+    chart_lock = asyncio.Lock()
 
-    async def render_chart():
-        if lock.locked():
+    async def load_chart():
+        if chart_lock.locked():
             return
-        async with lock:
-            chart_host.clear()
-            with chart_host:
-                ui.spinner(size="lg").classes("m-auto mt-24")
+        async with chart_lock:
+            status.set_text(f"{timeframe.value} 데이터를 불러오는 중...")
             try:
-                fig = await asyncio.to_thread(
-                    get_chart_figure,
+                options = await asyncio.to_thread(
+                    get_echart_options,
                     kis,
                     market,
                     exchange,
@@ -1587,65 +1936,89 @@ async def stock_detail(market, exchange, symbol):
                     timeframe.value,
                     tuple(ma.value or []),
                 )
-                chart_host.clear()
-                with chart_host:
-                    ui.plotly(fig).classes("w-full h-[620px]")
+                chart.options = options
+                chart.update()
+                status.set_text("마우스 휠/드래그로 확대·축소할 수 있습니다.")
             except Exception as exc:
-                chart_host.clear()
-                with chart_host:
-                    ui.label(
-                        f"차트 조회 실패: {exc}"
-                    ).classes("negative p-6")
+                status.set_text(f"차트 조회 실패: {exc}")
 
     timeframe.on(
         "update:model-value",
-        lambda _: render_chart(),
-        throttle=0.2,
+        lambda _: load_chart(),
+        throttle=0.15,
         leading_events=False,
         trailing_events=True,
     )
     ma.on(
         "update:model-value",
-        lambda _: render_chart(),
-        throttle=0.2,
+        lambda _: load_chart(),
+        throttle=0.15,
         leading_events=False,
         trailing_events=True,
     )
 
-    await asyncio.gather(load_quote(), render_chart())
-
+    await asyncio.gather(load_quote(), load_chart())
+    ui.timer(REFRESH_SECONDS, load_quote)
 
 
 @ui.page("/indicator/{kind}/{code}", response_timeout=15)
 async def indicator_detail(kind: str, code: str):
     add_style()
     _, set_theme = apply_theme()
+
     with ui.row().classes("w-full items-center justify-between"):
-        ui.button("이전 화면", icon="arrow_back", on_click=lambda: ui.run_javascript("history.back()")).props("flat no-caps")
+        ui.button(
+            "이전 화면", icon="arrow_back", on_click=lambda: ui.run_javascript("history.back()")
+        ).props("flat no-caps")
         with ui.row().classes("items-center gap-2"):
             theme_menu(set_theme)
             ui.button("시장 홈", icon="public", on_click=lambda: ui.navigate.to("/")).props("flat no-caps")
-    title = ui.label(MARKET_LABELS.get(code) if kind=="market" else MACRO_LABELS.get(code,code)).classes("text-3xl font-black main-text mt-5")
-    ui.label("시장 가격 시계열" if kind=="market" else "FRED 공식 경제 시계열").classes("text-sm muted")
-    ranges = ui.toggle({"1M":"1개월","3M":"3개월","1Y":"1년","5Y":"5년","10Y":"10년"}, value="1Y").props("unelevated").classes("mt-5")
-    chart = ui.column().classes("w-full chart-wrap min-h-[520px] mt-4")
-    with chart: ui.spinner(size="lg").classes("m-auto mt-20")
+
+    title = ui.label(
+        MARKET_LABELS.get(code, code) if kind == "market" else MACRO_LABELS.get(code, code)
+    ).classes("text-3xl font-black main-text mt-5")
+    ui.label("시장 가격 시계열" if kind == "market" else "FRED 공식 경제 시계열").classes("text-sm muted")
+
+    ranges = ui.toggle(
+        {"1M": "1개월", "3M": "3개월", "1Y": "1년", "5Y": "5년", "10Y": "10년"},
+        value="1Y",
+    ).props("unelevated").classes("mt-5")
+    status = ui.label("차트 준비 중...").classes("text-xs muted mt-2")
+    chart = ui.echart({
+        "animation": False,
+        "xAxis": {"type": "category", "data": []},
+        "yAxis": {"type": "value"},
+        "series": [],
+    }, renderer="canvas").classes("w-full h-[540px] chart-wrap mt-3")
+
     await ui.context.client.connected()
-    lock=asyncio.Lock()
+    lock = asyncio.Lock()
+
     async def render():
-        if lock.locked(): return
+        if lock.locked():
+            return
         async with lock:
-            chart.clear()
-            with chart: ui.spinner(size="lg").classes("m-auto mt-20")
+            status.set_text("데이터를 불러오는 중...")
             try:
-                resolved,fig=await asyncio.to_thread(make_indicator_figure,kind,code,ranges.value)
-                title.set_text(resolved); chart.clear()
-                with chart: ui.plotly(fig).classes("w-full h-[540px]")
+                resolved_title, options = await asyncio.to_thread(
+                    make_indicator_options, kind, code, ranges.value
+                )
+                title.set_text(resolved_title)
+                chart.options = options
+                chart.update()
+                status.set_text("드래그/휠로 구간을 확대할 수 있습니다.")
             except Exception as exc:
-                chart.clear()
-                with chart: ui.label(f"지표 차트 조회 실패: {exc}").classes("negative p-6")
-    ranges.on("update:model-value",lambda _:render(),throttle=0.2,leading_events=False,trailing_events=True)
+                status.set_text(f"지표 차트 조회 실패: {exc}")
+
+    ranges.on(
+        "update:model-value",
+        lambda _: render(),
+        throttle=0.15,
+        leading_events=False,
+        trailing_events=True,
+    )
     await render()
+
 
 @app.get("/health")
 def health():

@@ -147,3 +147,79 @@ def upsert_position(store,item,quantity,average_price):
 
 def delete_position(store,market,exchange,symbol):
     return _auth(store).table('portfolio').delete().eq('market',market).eq('exchange',exchange).eq('symbol',symbol).execute()
+
+
+def load_target_allocations(store):
+    response = (
+        _auth(store)
+        .table("target_allocations")
+        .select("id,symbol,name,market,exchange,target_weight,created_at,updated_at")
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def upsert_target_allocation(store, item, target_weight):
+    client = _auth(store)
+    user = client.auth.get_user().user
+    if not user:
+        raise RuntimeError("사용자 확인 실패")
+
+    payload = {
+        "user_id": str(user.id),
+        "symbol": item["symbol"],
+        "name": item["name"],
+        "market": item["market"],
+        "exchange": item["exchange"],
+        "target_weight": float(target_weight),
+    }
+    response = (
+        client.table("target_allocations")
+        .upsert(payload, on_conflict="user_id,market,exchange,symbol")
+        .execute()
+    )
+    return response.data[0] if response.data else payload
+
+
+def delete_target_allocation(store, market, exchange, symbol):
+    return (
+        _auth(store)
+        .table("target_allocations")
+        .delete()
+        .eq("market", market)
+        .eq("exchange", exchange)
+        .eq("symbol", symbol)
+        .execute()
+    )
+
+
+def get_rebalance_rule(store):
+    response = (
+        _auth(store)
+        .table("rebalance_rules")
+        .select("user_id,threshold_pct,enabled,updated_at")
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        return response.data[0]
+    return {"threshold_pct": 5, "enabled": True}
+
+
+def upsert_rebalance_rule(store, threshold_pct=5, enabled=True):
+    client = _auth(store)
+    user = client.auth.get_user().user
+    if not user:
+        raise RuntimeError("사용자 확인 실패")
+    payload = {
+        "user_id": str(user.id),
+        "threshold_pct": float(threshold_pct),
+        "enabled": bool(enabled),
+    }
+    response = (
+        client.table("rebalance_rules")
+        .upsert(payload, on_conflict="user_id")
+        .execute()
+    )
+    return response.data[0] if response.data else payload
