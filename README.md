@@ -91,3 +91,44 @@ Plotly stock-detail charts remain dark-themed in this release, even if the surro
 
 Performance impact of 12 cards is modest because quote history for the representative
 universe is still fetched in a single batch request per market/mode and cached.
+
+## v0.7 — Search + KIS Ranking + Indicator Charts + Portfolio
+
+### Full Korean stock search
+- Downloads official KIS KOSPI/KOSDAQ master files.
+- Full ticker/name autocomplete is cached in memory for 24 hours.
+- Public home warms the master index in the background after initial render.
+
+### Official Korean rankings
+- Market cap ranking: KIS `/uapi/domestic-stock/v1/ranking/market-cap`
+- Volume ranking: KIS `/uapi/domestic-stock/v1/quotations/volume-rank`
+- Public Korea cards prefer KIS and fall back to the prototype universe if the API is unavailable.
+
+### Indicator detail charts
+Click public market/macro cards.
+
+```text
+/indicator/market/^GSPC
+/indicator/market/KRW=X
+/indicator/macro/CPIAUCSL
+/indicator/macro/FEDFUNDS
+```
+
+Ranges: 1M / 3M / 1Y / 5Y / 10Y.
+
+### Portfolio
+Run this once in Supabase SQL Editor:
+
+```text
+supabase/schema_v0.7.sql
+```
+
+Then the personal dashboard supports:
+- quantity
+- average purchase price
+- current valuation
+- P/L
+- return
+- approximate combined KRW valuation using USD/KRW
+
+No new Render environment variable is required.

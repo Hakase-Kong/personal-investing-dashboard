@@ -3,6 +3,7 @@ from threading import Lock
 
 import pandas as pd
 import yfinance as yf
+from kr_master import search_master
 
 _CACHE = {}
 _LOCK = Lock()
@@ -120,22 +121,43 @@ def _load(rows, market):
     return result
 
 
-def get_representative_stocks(market="KR", mode="cap", limit=6):
-    market = market.upper()
-    mode = mode.lower()
+def _attach_sparklines(rows, limit=20):
+    if not rows:return rows
+    symbols=[]; mapping={}
+    for row in rows[:limit]:
+        symbol=row.get('symbol','')
+        if not symbol:continue
+        matches=search_master(symbol,limit=5)
+        exact=next((x for x in matches if x['symbol']==symbol),None)
+        if exact:
+            row['exchange']=exact['exchange']
+            row['name']=row.get('name') or exact['name']
+        ys=f"{symbol}.KQ" if row.get('exchange')=='KOSDAQ' else f"{symbol}.KS"
+        symbols.append(ys); mapping[ys]=row
+    if not symbols:return rows
+    try:
+        frame=yf.download(symbols,period='2mo',interval='1d',auto_adjust=False,progress=False,threads=True,group_by='column')
+        for ys,row in mapping.items():
+            closes=_series(frame,'Close',ys).dropna()
+            if len(closes):row['spark']=closes.tail(30).tolist()
+    except Exception:pass
+    return rows
 
+def get_representative_stocks(market='KR', mode='cap', limit=12, kis=None):
+    market=market.upper(); mode=mode.lower()
+    if market=='KR' and kis is not None and kis.enabled():
+        def load_kis():
+            try:
+                rows=kis.get_volume_rank('0000',limit) if mode=='volume' else kis.get_market_cap_rank('0000',limit)
+                rows=[r for r in rows if r.get('symbol')]
+                return _attach_sparklines(rows,limit)
+            except Exception:
+                data=_load(KR,'KR')
+                if mode=='volume':data.sort(key=lambda x:x.get('volume') or 0,reverse=True)
+                return data[:limit]
+        return _cached(f'kis-ranking:{mode}:{limit}',120,load_kis)
     def load():
-        data = _load(KR if market == "KR" else US, market)
-        if mode == "volume":
-            data.sort(
-                key=lambda x: x.get("volume") or 0,
-                reverse=True,
-            )
-        # cap mode keeps curated large-cap ordering.
+        data=_load(US if market=='US' else KR,market)
+        if mode=='volume':data.sort(key=lambda x:x.get('volume') or 0,reverse=True)
         return data[:limit]
-
-    return _cached(
-        f"representatives-v2:{market}:{mode}:{limit}",
-        180,
-        load,
-    )
+    return _cached(f'representatives-v3:{market}:{mode}:{limit}',180,load)

@@ -132,3 +132,18 @@ def sign_out(store):
             "user_id", "email", "display_name",
         ]:
             store.pop(key, None)
+
+
+def load_portfolio(store):
+    response=(_auth(store).table('portfolio').select('id,symbol,name,market,exchange,quantity,average_price,currency,created_at,updated_at').order('created_at',desc=False).execute())
+    return response.data or []
+
+def upsert_position(store,item,quantity,average_price):
+    client=_auth(store); user=client.auth.get_user().user
+    if not user:raise RuntimeError('사용자 확인 실패')
+    payload={'user_id':str(user.id),'symbol':item['symbol'],'name':item['name'],'market':item['market'],'exchange':item['exchange'],'quantity':float(quantity),'average_price':float(average_price),'currency':'KRW' if item['market']=='KR' else 'USD'}
+    response=client.table('portfolio').upsert(payload,on_conflict='user_id,market,exchange,symbol').execute()
+    return response.data[0] if response.data else payload
+
+def delete_position(store,market,exchange,symbol):
+    return _auth(store).table('portfolio').delete().eq('market',market).eq('exchange',exchange).eq('symbol',symbol).execute()

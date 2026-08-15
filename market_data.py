@@ -1,5 +1,6 @@
 from functools import lru_cache
 import yfinance as yf
+from kr_master import search_master
 
 KR_NAMES = [
     ("005930","삼성전자","KOSPI"),
@@ -30,80 +31,32 @@ KR_NAMES = [
 
 
 def search_stocks(query):
-    q = query.strip()
-    ql = q.lower()
-    result = []
-
-    for symbol, name, exchange in KR_NAMES:
+    q=(query or '').strip()
+    if not q:return []
+    ql=q.lower(); result=[]
+    result.extend(search_master(q,limit=20))
+    for symbol,name,exchange in KR_NAMES:
         if ql in symbol.lower() or ql in name.lower():
-            result.append({
-                "symbol": symbol,
-                "name": name,
-                "market": "KR",
-                "exchange": exchange,
-            })
-
-    if q.isdigit() and len(q) == 6 and not any(
-        x["symbol"] == q for x in result
-    ):
-        result.insert(0, {
-            "symbol": q,
-            "name": q,
-            "market": "KR",
-            "exchange": "KR",
-        })
-
+            result.append({'symbol':symbol,'name':name,'market':'KR','exchange':exchange})
+    if q.isdigit() and len(q)==6 and not any(x['symbol']==q and x['market']=='KR' for x in result):
+        result.insert(0,{'symbol':q,'name':q,'market':'KR','exchange':'KOSPI'})
     try:
-        search = yf.Search(q, max_results=10, news_count=0)
-        for item in getattr(search, "quotes", []) or []:
-            if str(item.get("quoteType", "")).upper() not in {
-                "EQUITY", "ETF"
-            }:
-                continue
-
-            symbol = str(item.get("symbol", "")).strip()
-            if (
-                not symbol
-                or symbol.endswith(".KS")
-                or symbol.endswith(".KQ")
-            ):
-                continue
-
-            result.append({
-                "symbol": symbol,
-                "name": str(
-                    item.get("longname")
-                    or item.get("shortname")
-                    or item.get("name")
-                    or symbol
-                ),
-                "market": "US",
-                "exchange": str(
-                    item.get("exchange")
-                    or item.get("exchDisp")
-                    or "US"
-                ).upper(),
-            })
-    except Exception:
-        pass
-
+        search=yf.Search(q,max_results=10,news_count=0)
+        for item in getattr(search,'quotes',[]) or []:
+            if str(item.get('quoteType','')).upper() not in {'EQUITY','ETF'}:continue
+            symbol=str(item.get('symbol','')).strip()
+            if not symbol or symbol.endswith('.KS') or symbol.endswith('.KQ'):continue
+            result.append({'symbol':symbol,'name':str(item.get('longname') or item.get('shortname') or item.get('name') or symbol),'market':'US','exchange':str(item.get('exchange') or item.get('exchDisp') or 'US').upper()})
+    except Exception:pass
     def score(item):
-        s = item["symbol"].lower()
-        n = item["name"].lower()
-        if s == ql:
-            return 0
-        if n == ql:
-            return 1
-        if s.startswith(ql):
-            return 2
-        if n.startswith(ql):
-            return 3
+        s=item['symbol'].lower(); n=item['name'].lower()
+        if s==ql:return 0
+        if n==ql:return 1
+        if s.startswith(ql):return 2
+        if n.startswith(ql):return 3
         return 4
-
-    unique = {}
-    for item in result:
-        unique[(item["market"], item["symbol"])] = item
-    return sorted(unique.values(), key=score)[:12]
+    unique={(x['market'],x['exchange'],x['symbol']):x for x in result}
+    return sorted(unique.values(),key=lambda x:(score(x),len(x['name'])))[:20]
 
 
 @lru_cache(maxsize=256)

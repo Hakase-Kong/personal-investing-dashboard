@@ -75,6 +75,31 @@ class KISClient:
             time.sleep(.08)
         return rows
 
+
+def get_market_cap_rank(self, market_code='0000', limit=20):
+    r=requests.get(f'{self.base_url}/uapi/domestic-stock/v1/ranking/market-cap',headers=self._headers('FHPST01740000'),params={
+        'FID_INPUT_PRICE_2':'','FID_COND_MRKT_DIV_CODE':'J','FID_COND_SCR_DIV_CODE':'20174','FID_DIV_CLS_CODE':'0','FID_INPUT_ISCD':market_code,'FID_TRGT_CLS_CODE':'0','FID_TRGT_EXLS_CLS_CODE':'0','FID_INPUT_PRICE_1':'','FID_VOL_CNT':''},timeout=10)
+    r.raise_for_status(); body=r.json()
+    if str(body.get('rt_cd'))!='0':raise RuntimeError(body.get('msg1') or 'KIS 시가총액 순위 조회 실패')
+    return [self._ranking_row(x) for x in (body.get('output') or [])[:limit]]
+
+def get_volume_rank(self, market_code='0000', limit=20):
+    r=requests.get(f'{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank',headers=self._headers('FHPST01710000'),params={
+        'FID_COND_MRKT_DIV_CODE':'J','FID_COND_SCR_DIV_CODE':'20171','FID_INPUT_ISCD':market_code,'FID_DIV_CLS_CODE':'0','FID_BLNG_CLS_CODE':'0','FID_TRGT_CLS_CODE':'111111111','FID_TRGT_EXLS_CLS_CODE':'0000000000','FID_INPUT_PRICE_1':'0','FID_INPUT_PRICE_2':'1000000','FID_VOL_CNT':'','FID_INPUT_DATE_1':''},timeout=10)
+    r.raise_for_status(); body=r.json()
+    if str(body.get('rt_cd'))!='0':raise RuntimeError(body.get('msg1') or 'KIS 거래량 순위 조회 실패')
+    return [self._ranking_row(x) for x in (body.get('output') or [])[:limit]]
+
+@staticmethod
+def _ranking_row(row):
+    symbol=row.get('mksc_shrn_iscd') or row.get('stck_shrn_iscd') or ''
+    name=row.get('hts_kor_isnm') or row.get('stck_kor_isnm') or symbol
+    price=_n(row.get('stck_prpr') or row.get('stck_prdy_clpr'))
+    pct=_n(row.get('prdy_ctrt'))
+    volume=_n(row.get('acml_vol') or row.get('acml_tr_pbmn'))
+    return {'symbol':symbol,'name':name,'market':'KR','exchange':'KOSPI','price':price,'percent':pct,'volume':volume,'spark':[]}
+
+
 def _n(v):
     try:return None if v in (None,"") else float(v)
     except Exception:return None
