@@ -4,19 +4,21 @@ from typing import MutableMapping
 from supabase import Client, create_client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-
-
-class SupabaseNotConfigured(RuntimeError):
-    pass
+SUPABASE_PUBLISHABLE_KEY = (
+    os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+    or os.getenv("SUPABASE_ANON_KEY", "")
+)
 
 
 def _client() -> Client:
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise SupabaseNotConfigured(
-            "SUPABASE_URL / SUPABASE_ANON_KEY 환경변수가 필요합니다."
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY가 필요합니다."
         )
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_PUBLISHABLE_KEY,
+    )
 
 
 def sign_up(email: str, password: str, display_name: str = ""):
@@ -26,9 +28,7 @@ def sign_up(email: str, password: str, display_name: str = ""):
             "email": email,
             "password": password,
             "options": {
-                "data": {
-                    "display_name": display_name,
-                }
+                "data": {"display_name": display_name}
             },
         }
     )
@@ -52,9 +52,10 @@ def _authenticated_client(session_store: MutableMapping):
         raise RuntimeError("로그인이 필요합니다.")
 
     client = _client()
-
-    # Supabase set_session refreshes an expired access token when needed.
-    response = client.auth.set_session(access_token, refresh_token)
+    response = client.auth.set_session(
+        access_token,
+        refresh_token,
+    )
 
     if response.session:
         session_store["access_token"] = response.session.access_token
@@ -78,7 +79,7 @@ def get_profile(session_store: MutableMapping):
     client = _authenticated_client(session_store)
     response = (
         client.table("profiles")
-        .select("user_id, display_name, created_at")
+        .select("user_id, display_name, avatar_url, created_at")
         .limit(1)
         .execute()
     )
@@ -87,7 +88,6 @@ def get_profile(session_store: MutableMapping):
 
 def load_watchlist(session_store: MutableMapping):
     client = _authenticated_client(session_store)
-
     response = (
         client.table("watchlist")
         .select("id, symbol, name, market, exchange, created_at")
@@ -130,7 +130,6 @@ def add_watchlist(session_store: MutableMapping, item: dict):
         )
         .execute()
     )
-
     return response.data[0] if response.data else item
 
 
@@ -141,7 +140,6 @@ def delete_watchlist(
     symbol: str,
 ):
     client = _authenticated_client(session_store)
-
     return (
         client.table("watchlist")
         .delete()

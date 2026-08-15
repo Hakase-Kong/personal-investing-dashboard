@@ -13,13 +13,23 @@ services:
         value: real
       - key: REFRESH_SECONDS
         value: 5
+      - key: ENABLE_GOOGLE
+        value: true
+      - key: ENABLE_KAKAO
+        value: true
+      - key: ENABLE_NAVER
+        value: true
+      - key: ENABLE_APPLE
+        value: false
+      - key: APP_URL
+        sync: false
       - key: KIS_APP_KEY
         sync: false
       - key: KIS_APP_SECRET
         sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_ANON_KEY
+      - key: SUPABASE_PUBLISHABLE_KEY
         sync: false
       - key: STORAGE_SECRET
         generateValue: true

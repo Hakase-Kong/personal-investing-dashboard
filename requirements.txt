@@ -3,3 +3,5 @@ requests>=2.32
 python-dotenv>=1.0
 yfinance>=0.2.54
 supabase>=2.18,<3
+pandas>=2.2,<3
+plotly>=6.0,<7

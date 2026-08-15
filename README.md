@@ -1,133 +1,201 @@
-# My Market NiceGUI v0.1
+# My Market NiceGUI v0.3 — Social Auth + Charts
 
-Python만으로 만든 개인 투자 대시보드입니다.
+## Included
 
-## 구조
+- Email/password Auth
+- Google Auth
+- Kakao Auth
+- Apple Auth button (disabled by default)
+- Naver Auth through Supabase Custom OIDC (`custom:naver`)
+- Supabase user-specific Watchlist + RLS
+- Stock detail page
+- 1-day intraday chart
+- Daily / weekly / monthly candlestick chart
+- Volume
+- MA5 / MA20 / MA60 / MA120 selectors
+- Korean current prices via KIS
+- Korean historical chart via KIS with Yahoo fallback
+- US market charts/current prices via Yahoo Finance
+- Render deployment
+
+## GitHub files
+
+Upload:
 
 ```text
-main.py          NiceGUI 화면 + 웹서버
-kis.py           한국투자증권 REST 현재가
-market_data.py   종목 검색 + 미국 현재가
-storage.py       관심종목 저장
+main.py
+kis.py
+chart_data.py
+market_data.py
+supabase_store.py
+requirements.txt
+render.yaml
+.gitignore
+supabase/schema.sql
+README.md (optional)
 ```
 
-Node.js, Next.js, Streamlit, Docker가 필요 없습니다.
+Never upload `.env`.
 
-## 로컬 실행
+## Render Environment
 
-### 1. Python 확인
+```text
+APP_URL=https://YOUR-SERVICE.onrender.com
 
-```bash
-python --version
-```
-
-Python 3.11~3.12 권장.
-
-### 2. 가상환경
-
-Windows:
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-### 3. 설치
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. 환경설정
-
-```bash
-copy .env.example .env
-notepad .env
-```
-
-입력:
-
-```env
-KIS_APP_KEY=본인_APP_KEY
-KIS_APP_SECRET=본인_APP_SECRET
+KIS_APP_KEY=...
+KIS_APP_SECRET=...
 KIS_ENV=real
+
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+
+STORAGE_SECRET=long-random-value
+
+ENABLE_GOOGLE=true
+ENABLE_KAKAO=true
+ENABLE_NAVER=true
+ENABLE_APPLE=false
+
 REFRESH_SECONDS=5
-PORT=8080
 ```
 
-### 5. 실행
+## Supabase
 
-```bash
-python main.py
-```
+Run `supabase/schema.sql`.
 
-브라우저:
+In Authentication -> URL Configuration:
 
 ```text
-http://localhost:8080
+Site URL:
+https://YOUR-SERVICE.onrender.com
+
+Redirect URLs:
+https://YOUR-SERVICE.onrender.com/oauth/callback
 ```
 
-## Render
+This app uses Supabase browser implicit OAuth flow:
+provider -> Supabase callback -> your `/oauth/callback` -> NiceGUI user session.
 
-GitHub에 이 폴더를 올리고 Render에서:
+## Provider callback URL
+
+Google/Kakao/Apple/Naver developer consoles should NOT point directly
+to the Render `/oauth/callback`.
+
+The OAuth provider callback URL is Supabase's callback:
 
 ```text
-New → Blueprint
+https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback
 ```
 
-로 repository를 선택합니다.
-
-`render.yaml`이 설정을 자동으로 잡습니다.
-
-Render Environment에서:
+Supabase then redirects to:
 
 ```text
-KIS_APP_KEY
-KIS_APP_SECRET
+https://YOUR-SERVICE.onrender.com/oauth/callback
 ```
 
-만 실제 값으로 입력합니다.
+after authentication.
 
-배포 후:
+## Google
+
+1. Google Cloud Console -> project.
+2. Google Auth Platform/OAuth consent screen: configure app name/audience.
+3. Create OAuth Client ID -> Web application.
+4. Add Supabase callback to Authorized redirect URIs:
+   `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback`
+5. Copy Google Client ID and Client Secret.
+6. Supabase -> Authentication -> Providers -> Google -> enable.
+7. Paste Client ID / Client Secret.
+
+## Kakao
+
+1. Kakao Developers -> create app.
+2. App -> Platform Key -> copy REST API Key.
+3. Enable Kakao Login.
+4. REST API Key settings -> Redirect URI:
+   `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback`
+5. Create/enable Client Secret.
+6. Configure consent scopes, e.g. profile nickname/image.
+7. If email is required, configure `account_email`; availability can depend on Kakao app setup.
+8. Supabase -> Authentication -> Providers -> Kakao.
+9. Client ID = Kakao REST API Key.
+10. Client Secret = Kakao Client Secret.
+
+## Naver
+
+Naver is not a built-in Supabase provider. Naver officially provides OIDC.
+
+1. Naver Developers -> Application -> register application.
+2. Select Naver Login.
+3. Set service URL and callback.
+4. Callback should be the callback URL shown by the Supabase Custom Provider form.
+5. Copy Naver Client ID / Client Secret.
+6. Supabase -> Authentication -> Providers -> Add Custom Provider.
+7. Type: OIDC / Auto-discovery.
+8. Identifier: `custom:naver`
+9. Client ID / Client Secret: Naver values.
+10. Issuer URL:
+    `https://nid.naver.com`
+11. Enable provider.
+12. Keep `ENABLE_NAVER=true` in Render.
+
+Naver's discovery document is:
+`https://nid.naver.com/.well-known/openid-configuration`
+
+For unrestricted production use, review Naver's service/review requirements.
+
+## Apple
+
+Apple web auth setup is more involved.
+
+1. Apple Developer -> Certificates, Identifiers & Profiles.
+2. Create/choose a primary App ID with Sign in with Apple enabled.
+3. Create a Services ID for the website.
+4. Configure Sign in with Apple on that Services ID.
+5. Domains/Subdomains: Supabase project domain:
+   `YOUR_PROJECT_REF.supabase.co`
+6. Return URL:
+   `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback`
+7. Create a Sign in with Apple key and download the private key once.
+8. Note Team ID, Key ID, Services ID and private key.
+9. Supabase -> Authentication -> Providers -> Apple.
+10. Enter the Apple configuration requested by Supabase.
+11. Turn `ENABLE_APPLE=true` in Render.
+
+Apple's web setup depends on Apple Developer program capabilities and is
+the one provider here that may conflict with a strict zero-cost goal.
+
+## Charts
+
+Click any Watchlist card.
+
+Routes:
 
 ```text
-https://my-market-nicegui-xxxx.onrender.com
+/stock/KR/KOSPI/005930
+/stock/US/NMS/NVDA
 ```
 
-형태의 주소를 받습니다.
+Periods:
 
-UptimeRobot은:
+- `1D`: intraday
+- `D`: daily
+- `W`: weekly
+- `M`: monthly
 
-```text
-https://my-market-nicegui-xxxx.onrender.com/health
-```
+Moving averages:
 
-를 모니터링 대상으로 사용하면 됩니다.
+- MA5
+- MA20
+- MA60
+- MA120
 
-## 현재 기능
+KIS domestic period chart endpoint is used for KR D/W/M.
+KIS intraday endpoint is used for KR 1D with Yahoo fallback.
+US charts use Yahoo Finance in this version.
 
-- Python + NiceGUI
-- 한국/미국 통합 검색창
-- 관심종목 추가/삭제
-- 한국 KIS 실제 현재가
-- 미국 무료 현재가
-- 5초 자동 업데이트
-- 휴장일 마지막 가격 표시
-- Render 배포 설정
-- `/health`
+## Note on KIS traffic
 
-## v0.2에서 할 것
-
-- KIS 전체 국내 종목 마스터 자동 다운로드
-- 관심종목 Supabase 영구 저장
-- 보유수량/평단
-- 평가금액/손익
-- USD/KRW
-- 미국 KIS 데이터 통합
-
-## v0.3
-
-- KIS WebSocket 실시간 체결
-- 뉴스
-- FRED / ECOS
-- Telegram Alert
+The intraday KIS endpoint returns at most 30 bars per call, so the code
+walks backward through the session and caches the result for 60 seconds.
+Historical charts are cached longer. This is important when several users
+view the same stock.
