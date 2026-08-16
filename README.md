@@ -205,3 +205,58 @@ No new Render environment variable is required compared with v0.7.
 - Portfolio Lab historical data: cached ~30 min
 
 For a commercial/public redistribution service, review data licensing and redistribution terms before scaling beyond personal/prototype use.
+
+
+## v0.9 — Tabs / currency / card alignment / NAVER News
+
+### Personal dashboard tabs
+- Overview
+- Portfolio
+- Portfolio Lab
+- Market
+- News
+
+### Watchlist card layout
+Cards use a fixed internal grid:
+- fixed two-line name area
+- market badge fixed at the top-right
+- fixed price/change area
+- fixed sparkline area
+- actions pinned to the bottom
+- delete moved into the `...` menu
+
+This keeps Korean and long US names vertically aligned.
+
+### Portfolio input and valuation safety
+- quantity must be > 0
+- average price must be > 0
+- KR stocks explicitly use KRW / ₩
+- US stocks explicitly use USD / $
+- a failed current-price fetch is no longer treated as zero
+- unpriced positions are excluded from total valuation/P&L instead of showing a false -100% loss
+
+### Base currency
+Portfolio summary and allocation can use:
+- KRW
+- USD
+
+USD positions are converted with the current USD/KRW snapshot. The selected base currency is stored in Supabase `user_preferences`.
+
+Run once:
+```text
+supabase/schema_v0.9.sql
+```
+
+### NAVER News
+Add these Render environment variables:
+```text
+NAVER_CLIENT_ID
+NAVER_CLIENT_SECRET
+```
+
+The News tab supports:
+- Integrated
+- NAVER
+- Yahoo
+
+NAVER results and Yahoo results are de-duplicated by normalized title.

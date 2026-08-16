@@ -223,3 +223,41 @@ def upsert_rebalance_rule(store, threshold_pct=5, enabled=True):
         .execute()
     )
     return response.data[0] if response.data else payload
+
+
+
+def get_user_preferences(store):
+    client = _auth(store)
+    user = client.auth.get_user().user
+    if not user:
+        raise RuntimeError("사용자 확인 실패")
+    response = (
+        client.table("user_preferences")
+        .select("user_id,base_currency,updated_at")
+        .eq("user_id", str(user.id))
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        return response.data[0]
+    return {"user_id": str(user.id), "base_currency": "KRW"}
+
+
+def save_base_currency(store, base_currency):
+    base_currency = str(base_currency or "KRW").upper()
+    if base_currency not in {"KRW", "USD"}:
+        raise ValueError("기준통화는 KRW 또는 USD만 가능합니다.")
+    client = _auth(store)
+    user = client.auth.get_user().user
+    if not user:
+        raise RuntimeError("사용자 확인 실패")
+    payload = {
+        "user_id": str(user.id),
+        "base_currency": base_currency,
+    }
+    response = (
+        client.table("user_preferences")
+        .upsert(payload, on_conflict="user_id")
+        .execute()
+    )
+    return response.data[0] if response.data else payload
