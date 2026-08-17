@@ -9,26 +9,26 @@ import websockets
 
 
 class USRealtimeHub:
-    """Shared KIS overseas-stock realtime hub for one NiceGUI process.
+    """Shared KIS overseas-stock realtime hub.
 
-    - One websocket for all active US symbols.
-    - `subscribe_many` batches subscription changes so the socket is restarted once.
-    - Automatic reconnect with exponential backoff.
-    - Per-symbol snapshots keep PRE / REGULAR / POST values separately.
-
-    KIS HDFSCNT0 payload layout follows the official sample:
-    RSYM, SYMB, ZDIV, TYMD, XYMD, XHMS, KYMD, KHMS, OPEN, HIGH, LOW,
-    LAST, SIGN, DIFF, RATE, PBID, PASK, VBID, VASK, EVOL, TVOL, TAMT,
-    BIVL, ASVL, STRN, MTYP.
+    Improvements over v1.2:
+    - subscription ACK state per symbol
+    - official-sample pacing (0.5s between subscriptions)
+    - reconnect without losing last-known prices
+    - optional batched REST/Yahoo fallback provider
+    - explicit LIVE / ACKED / FALLBACK / ERROR state instead of endless 'waiting'
     """
 
-    def __init__(self, app_key: str, app_secret: str, env: str = "real"):
+    def __init__(self, app_key: str, app_secret: str, env: str = "real", fallback_provider=None):
         self.app_key = app_key
         self.app_secret = app_secret
         self.env = env
-        self.subscriptions = {}  # symbol -> exchange
-        self.snapshots = {}
+        self.fallback_provider = fallback_provider
+        self.subscriptions: dict[str, str] = {}
+        self.snapshots: dict[str, dict] = {}
+        self.status: dict[str, dict] = {}
         self._task = None
+        self._fallback_task = None
         self._lock = asyncio.Lock()
         self._generation = 0
         self._last_socket_error = ""
@@ -69,7 +69,6 @@ class USRealtimeHub:
             return "DNAS"
         if "AMEX" in e or e in {"ASE", "AMX", "AMS"}:
             return "DAMS"
-        # NYSE / ARCA / PCX are routed through the NYS family for the free feed.
         return "DNYS"
 
     @staticmethod
@@ -90,10 +89,8 @@ class USRealtimeHub:
         await self.subscribe_many([(symbol, exchange)])
 
     async def subscribe_many(self, items):
-        """Add many symbols and restart the socket only once if the set changed."""
-        if not self.enabled:
+        if not items:
             return
-
         changed = False
         async with self._lock:
             for symbol, exchange in items:
@@ -104,21 +101,25 @@ class USRealtimeHub:
                 if self.subscriptions.get(symbol) != exchange:
                     self.subscriptions[symbol] = exchange
                     changed = True
+                state = self.status.setdefault(symbol, {})
+                state.setdefault("state", "SUBSCRIBING")
 
-            # Conservative limit: keep at most 30 stock trade subscriptions.
+            # Keep within a conservative subscription budget.
             while len(self.subscriptions) > 30:
                 oldest = next(iter(self.subscriptions))
                 self.subscriptions.pop(oldest, None)
+                self.status.pop(oldest, None)
                 changed = True
 
-            if not changed and self._task and not self._task.done():
-                return
+            if changed or not self._task or self._task.done():
+                self._generation += 1
+                generation = self._generation
+                if self._task and not self._task.done():
+                    self._task.cancel()
+                self._task = asyncio.create_task(self._supervise(generation))
 
-            self._generation += 1
-            generation = self._generation
-            if self._task and not self._task.done():
-                self._task.cancel()
-            self._task = asyncio.create_task(self._supervise(generation))
+            if self.fallback_provider and (not self._fallback_task or self._fallback_task.done()):
+                self._fallback_task = asyncio.create_task(self._fallback_loop())
 
     def seed_extended(self, symbol: str, data: dict):
         symbol = symbol.upper()
@@ -126,19 +127,102 @@ class USRealtimeHub:
         for key in ("premarket", "regular", "afterhours"):
             if data.get(key) is not None:
                 snap[key] = data[key]
+        if data.get("last") is not None:
+            snap["fallback_last"] = data["last"]
+        if data.get("percent") is not None:
+            snap["fallback_percent"] = data["percent"]
+        if data.get("change") is not None:
+            snap["fallback_change"] = data["change"]
         if data.get("session"):
             snap["session"] = data["session"]
-        snap.setdefault("source", "POLL")
+        snap["fallback_at"] = time.time()
 
     def get(self, symbol: str):
-        snap = dict(self.snapshots.get(symbol.upper(), {}))
+        symbol = symbol.upper()
+        snap = dict(self.snapshots.get(symbol, {}))
+        state = dict(self.status.get(symbol, {}))
+        now = time.time()
         updated = snap.get("updated_at", 0)
-        snap["live"] = bool(updated and time.time() - updated < 15)
-        if not snap.get("session"):
-            snap["session"] = self.session_now()
-        if self._last_socket_error and not snap.get("ws_error"):
-            snap["ws_error"] = self._last_socket_error
+        live = bool(updated and now - updated < 12)
+        session = snap.get("session") or self.session_now()
+
+        if live:
+            source_state = "LIVE"
+            value = snap.get("last")
+            pct = snap.get("percent")
+            change = snap.get("change")
+        elif snap.get("fallback_at") and now - snap.get("fallback_at", 0) < 25:
+            source_state = "FALLBACK"
+            value = snap.get("fallback_last")
+            pct = snap.get("fallback_percent")
+            change = snap.get("fallback_change")
+        elif state.get("acked"):
+            source_state = "ACKED"
+            value = snap.get("last")
+            pct = snap.get("percent")
+            change = snap.get("change")
+        elif state.get("error"):
+            source_state = "ERROR"
+            value = snap.get("last")
+            pct = snap.get("percent")
+            change = snap.get("change")
+        else:
+            source_state = "SUBSCRIBING"
+            value = snap.get("last")
+            pct = snap.get("percent")
+            change = snap.get("change")
+
+        snap.update(
+            {
+                "live": live,
+                "session": session,
+                "state": source_state,
+                "display_last": value,
+                "display_percent": pct,
+                "display_change": change,
+                "acked": bool(state.get("acked")),
+                "ws_error": state.get("error") or self._last_socket_error,
+            }
+        )
         return snap
+
+    def diagnostics(self):
+        return {
+            "subscriptions": len(self.subscriptions),
+            "socket_error": self._last_socket_error,
+            "symbols": {
+                s: {
+                    **self.status.get(s, {}),
+                    "last_tick_age": (
+                        round(time.time() - self.snapshots.get(s, {}).get("updated_at", 0), 1)
+                        if self.snapshots.get(s, {}).get("updated_at")
+                        else None
+                    ),
+                }
+                for s in self.subscriptions
+            },
+        }
+
+    async def _fallback_loop(self):
+        while True:
+            await asyncio.sleep(8)
+            symbols = list(self.subscriptions.items())
+            if not symbols:
+                continue
+            stale = []
+            now = time.time()
+            for symbol, exchange in symbols:
+                last_tick = self.snapshots.get(symbol, {}).get("updated_at", 0)
+                if not last_tick or now - last_tick > 10:
+                    stale.append((symbol, exchange))
+            if not stale:
+                continue
+            try:
+                data = await asyncio.to_thread(self.fallback_provider, stale)
+                for symbol, payload in (data or {}).items():
+                    self.seed_extended(symbol, payload)
+            except Exception:
+                pass
 
     async def _supervise(self, generation: int):
         backoff = 1.0
@@ -151,7 +235,7 @@ class USRealtimeHub:
             except Exception as exc:
                 self._last_socket_error = str(exc)[:180]
                 for symbol in self.subscriptions:
-                    self.snapshots.setdefault(symbol, {})["ws_error"] = self._last_socket_error
+                    self.status.setdefault(symbol, {})["error"] = self._last_socket_error
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 20.0)
 
@@ -163,8 +247,12 @@ class USRealtimeHub:
             close_timeout=3,
             open_timeout=8,
         ) as ws:
+            self._last_socket_error = ""
             current = list(self.subscriptions.items())
             for symbol, exchange in current:
+                self.status.setdefault(symbol, {}).update(
+                    {"state": "SUBSCRIBING", "error": "", "acked": False}
+                )
                 tr_key = f"{self._prefix(exchange)}{symbol}"
                 payload = {
                     "header": {
@@ -173,18 +261,18 @@ class USRealtimeHub:
                         "tr_type": "1",
                         "content-type": "utf-8",
                     },
-                    "body": {
-                        "input": {
-                            "tr_id": "HDFSCNT0",
-                            "tr_key": tr_key,
-                        }
-                    },
+                    "body": {"input": {"tr_id": "HDFSCNT0", "tr_key": tr_key}},
                 }
                 await ws.send(json.dumps(payload, ensure_ascii=False))
-                await asyncio.sleep(0.12)
+                # Official KIS websocket sample spaces subscriptions by 0.5 sec.
+                await asyncio.sleep(0.5)
 
             while generation == self._generation:
-                data = await asyncio.wait_for(ws.recv(), timeout=45)
+                try:
+                    data = await asyncio.wait_for(ws.recv(), timeout=45)
+                except asyncio.TimeoutError:
+                    await ws.ping()
+                    continue
                 if not data:
                     continue
                 if isinstance(data, bytes):
@@ -198,7 +286,6 @@ class USRealtimeHub:
                         count = int(parts[2])
                     except Exception:
                         count = 1
-
                     fields = parts[3].split("^")
                     width = 26
                     for i in range(max(1, count)):
@@ -218,7 +305,6 @@ class USRealtimeHub:
                             pct = float(row[14])
                         except Exception:
                             pct = None
-
                         session = self.session_now()
                         snap = self.snapshots.setdefault(symbol, {})
                         snap.update(
@@ -240,18 +326,33 @@ class USRealtimeHub:
                             snap["regular"] = price
                         elif session == "POST":
                             snap["afterhours"] = price
+                        self.status.setdefault(symbol, {}).update(
+                            {"state": "LIVE", "acked": True, "error": ""}
+                        )
 
                 elif data.startswith("{"):
                     try:
                         message = json.loads(data)
-                        tr_id = message.get("header", {}).get("tr_id")
+                        header = message.get("header", {})
+                        tr_id = header.get("tr_id")
                         if tr_id == "PINGPONG":
                             await ws.pong(data.encode())
                             continue
                         body = message.get("body", {})
-                        if str(body.get("rt_cd", "0")) != "0":
-                            msg = body.get("msg1") or "KIS websocket subscription error"
-                            if msg != "ALREADY IN SUBSCRIBE":
-                                self._last_socket_error = str(msg)[:180]
+                        tr_key = str(header.get("tr_key") or "")
+                        symbol = next(
+                            (s for s in self.subscriptions if tr_key.endswith(s)),
+                            None,
+                        )
+                        rt_cd = str(body.get("rt_cd", "0"))
+                        msg = str(body.get("msg1") or "")
+                        if symbol:
+                            state = self.status.setdefault(symbol, {})
+                            if rt_cd == "0" or msg == "ALREADY IN SUBSCRIBE":
+                                state.update({"acked": True, "state": "ACKED", "error": ""})
+                            else:
+                                state.update({"acked": False, "state": "ERROR", "error": msg})
+                        if rt_cd != "0" and msg != "ALREADY IN SUBSCRIBE":
+                            self._last_socket_error = msg[:180]
                     except Exception:
                         pass

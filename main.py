@@ -10,12 +10,14 @@ from nicegui import app, ui
 
 from chart_data import get_echart_options
 from bond_ui import render_bond_panel
+from data_engine import engine
 from global_market_data import (
     get_futures_snapshot,
     get_fx_snapshot,
     get_us_yield_curve,
     get_kr_yield_curve,
     get_us_extended_session,
+    get_us_extended_batch,
     get_us_bond_history,
     get_kr_bond_history,
     get_us_spread_history,
@@ -89,7 +91,21 @@ us_realtime = USRealtimeHub(
     os.getenv('KIS_APP_KEY', ''),
     os.getenv('KIS_APP_SECRET', ''),
     os.getenv('KIS_ENV', 'real'),
+    fallback_provider=get_us_extended_batch,
 )
+
+# Shared background cache. These feeds start warming when the Render process starts,
+# not when a user opens a page.
+engine.register('markets', get_market_overview, 30)
+engine.register('macro', get_macro_overview, 900)
+engine.register('futures', get_futures_snapshot, 60)
+engine.register('fx', get_fx_snapshot, 60)
+engine.register('us_curve', get_us_yield_curve, 600)
+engine.register('kr_curve', get_kr_yield_curve, 600)
+engine.register('us_heat', get_us_heatmap, 180)
+engine.register('kr_heat', lambda: get_kr_heatmap(kis, 24), 180)
+app.on_startup(engine.start)
+app.on_shutdown(engine.stop)
 
 
 
@@ -635,14 +651,16 @@ async def public_home():
                         ui.html(svg).classes("w-full mt-2")
 
     async def load_global_snapshot():
-        futures, fx, us_curve, kr_curve, us_heat, kr_heat = await asyncio.gather(
-            asyncio.to_thread(get_futures_snapshot),
-            asyncio.to_thread(get_fx_snapshot),
-            asyncio.to_thread(get_us_yield_curve),
-            asyncio.to_thread(get_kr_yield_curve),
-            asyncio.to_thread(get_us_heatmap),
-            asyncio.to_thread(get_kr_heatmap, kis, 24),
-        )
+        keys = ["futures", "fx", "us_curve", "kr_curve", "us_heat", "kr_heat"]
+        missing = [k for k in keys if engine.get(k) is None]
+        if missing:
+            await asyncio.gather(*(engine.refresh(k) for k in missing))
+        futures = engine.get("futures", [])
+        fx = engine.get("fx", [])
+        us_curve = engine.get("us_curve", [])
+        kr_curve = engine.get("kr_curve", [])
+        us_heat = engine.get("us_heat", [])
+        kr_heat = engine.get("kr_heat", [])
 
         def render_cards(host, rows, value_fmt):
             host.clear()
@@ -698,31 +716,39 @@ async def public_home():
         for symbol, refs in list(public_stock_refs.items()):
             snap = us_realtime.get(symbol)
             session = snap.get("session", "CLOSED")
-            live = snap.get("live", False)
-            value = snap.get("last")
-            pct = snap.get("percent")
-            change = snap.get("change")
+            value = snap.get("display_last")
+            pct = snap.get("display_percent")
+            state_name = snap.get("state", "SUBSCRIBING")
 
-            if live and value is not None:
-                refs["price"].set_text(f"${value:,.2f}")
-                refs["pct"].set_text("-" if pct is None else f"{pct:+.2f}%")
+            if value is not None:
+                refs["price"].set_text(f"${float(value):,.2f}")
+            if pct is not None:
+                refs["pct"].set_text(f"{float(pct):+.2f}%")
                 refs["pct"].classes(remove="positive negative muted")
-                refs["pct"].classes(add=delta_class(pct))
-                session_text = {
-                    "PRE": "● PRE LIVE",
-                    "REGULAR": "● REG LIVE",
-                    "POST": "● POST LIVE",
-                }.get(session, "● LIVE")
-                refs["session"].set_text(session_text)
+                refs["pct"].classes(add=delta_class(float(pct)))
+
+            session_short = {"PRE": "PRE", "REGULAR": "REG", "POST": "POST"}.get(session, session)
+            if state_name == "LIVE":
+                label = f"● {session_short} LIVE"
                 refs["session"].classes(remove="muted positive negative")
                 refs["session"].classes(add="positive" if (pct or 0) >= 0 else "negative")
-            else:
-                current = USRealtimeHub.session_now()
-                refs["session"].set_text(
-                    "" if current == "CLOSED" else f"{current} · 연결 대기"
-                )
+            elif state_name == "FALLBACK":
+                label = f"◌ {session_short} · 12s FALLBACK"
                 refs["session"].classes(remove="positive negative")
                 refs["session"].classes(add="muted")
+            elif state_name == "ACKED":
+                label = f"◌ {session_short} · WS 구독됨"
+                refs["session"].classes(remove="positive negative")
+                refs["session"].classes(add="muted")
+            elif state_name == "ERROR":
+                label = f"! {session_short} · REST fallback"
+                refs["session"].classes(remove="positive negative")
+                refs["session"].classes(add="muted")
+            else:
+                label = f"◌ {session_short} · WS 구독중" if session != "CLOSED" else ""
+                refs["session"].classes(remove="positive negative")
+                refs["session"].classes(add="muted")
+            refs["session"].set_text(label)
 
     async def load_stocks():
         data = await asyncio.to_thread(
@@ -885,16 +911,15 @@ async def public_home():
                         )
                     ).classes("text-xs muted")
 
-    # Major speed-up: independent feeds load in parallel.
-    await asyncio.gather(
-        load_markets(),
-        load_global_snapshot(),
-        load_stocks(),
-        load_macro(),
-        load_news(),
-    )
+    # v1.3: do not hold the HTTP page response for upstream market APIs.
+    # The user sees the shell immediately while cached/background feeds paint in.
+    asyncio.create_task(load_markets())
+    asyncio.create_task(load_stocks())
+    asyncio.create_task(load_global_snapshot())
+    asyncio.create_task(load_macro())
+    asyncio.create_task(load_news())
 
-    ui.timer(60, load_markets)
+    ui.timer(30, load_markets)
     ui.timer(1.0, refresh_public_us_live)
     ui.timer(300, load_news)
 
@@ -2115,14 +2140,16 @@ async def personal_dashboard():
                         ui.html(svg).classes("w-full mt-2")
 
         async def render_market_center():
-            futures, fx, us_curve, kr_curve, us_heat, kr_heat = await asyncio.gather(
-                asyncio.to_thread(get_futures_snapshot),
-                asyncio.to_thread(get_fx_snapshot),
-                asyncio.to_thread(get_us_yield_curve),
-                asyncio.to_thread(get_kr_yield_curve),
-                asyncio.to_thread(get_us_heatmap),
-                asyncio.to_thread(get_kr_heatmap, kis, 24),
-            )
+            keys = ["futures", "fx", "us_curve", "kr_curve", "us_heat", "kr_heat"]
+            missing = [k for k in keys if engine.get(k) is None]
+            if missing:
+                await asyncio.gather(*(engine.refresh(k) for k in missing))
+            futures = engine.get("futures", [])
+            fx = engine.get("fx", [])
+            us_curve = engine.get("us_curve", [])
+            kr_curve = engine.get("kr_curve", [])
+            us_heat = engine.get("us_heat", [])
+            kr_heat = engine.get("kr_heat", [])
             futures_grid2.clear()
             with futures_grid2:
                 for item in futures:
@@ -2162,7 +2189,7 @@ async def personal_dashboard():
                 with bonds_host2:
                     ui.label("한국 국고채 다만기 데이터는 ECOS_API_KEY 설정을 권장합니다. sample 키는 호출 제한이 큽니다.").classes("text-xs muted")
 
-        await render_market_center()
+        asyncio.create_task(render_market_center())
 
     with news_host:
         with ui.row().classes("w-full items-end justify-between"):
@@ -2343,14 +2370,16 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             return
         snap = us_realtime.get(symbol)
 
-        # Keep the headline price synchronized with the live PRE/REG/POST trade.
-        if snap.get('live') and snap.get('last') is not None:
-            price_label.set_text(f"${float(snap['last']):,.2f}")
-            live_change = snap.get('change')
-            live_pct = snap.get('percent')
+        # Keep the headline synchronized with WS; use the batched fallback when WS is stale.
+        display_last = snap.get('display_last')
+        if display_last is not None:
+            price_label.set_text(f"${float(display_last):,.2f}")
+            live_change = snap.get('display_change')
+            live_pct = snap.get('display_percent')
+            prefix = 'LIVE' if snap.get('state') == 'LIVE' else 'FALLBACK'
             change_label.set_text(
-                'LIVE' if live_change is None or live_pct is None
-                else f"${float(live_change):+,.2f} ({float(live_pct):+.2f}%)"
+                prefix if live_change is None or live_pct is None
+                else f"${float(live_change):+,.2f} ({float(live_pct):+.2f}%) · {prefix}"
             )
 
         for key in ('premarket','regular','afterhours'):
@@ -2366,15 +2395,26 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             else:
                 delta_label.set_text('')
         session = snap.get('session','CLOSED')
-        source = 'KIS LIVE' if snap.get('live') else snap.get('source','POLL')
+        source_map = {
+            'LIVE': 'KIS WS LIVE',
+            'FALLBACK': '12s FALLBACK',
+            'ACKED': 'KIS WS 구독됨 · 체결대기',
+            'ERROR': 'WS ERROR · FALLBACK',
+            'SUBSCRIBING': 'KIS WS 구독중',
+        }
+        source = source_map.get(snap.get('state'), snap.get('source','POLL'))
         extended_refs['session'].set_text(f'현재 세션: {session} · {source}')
 
     async def load_extended_hours():
         if market != 'US':
             return
         try:
-            polled = await asyncio.to_thread(get_us_extended_session, symbol)
-            us_realtime.seed_extended(symbol, polled)
+            batch = await asyncio.to_thread(get_us_extended_batch, [(symbol, exchange)])
+            if batch.get(symbol):
+                us_realtime.seed_extended(symbol, batch[symbol])
+            else:
+                polled = await asyncio.to_thread(get_us_extended_session, symbol)
+                us_realtime.seed_extended(symbol, polled)
         except Exception:
             pass
         try:
@@ -2543,6 +2583,20 @@ async def indicator_detail(kind: str, code: str):
         trailing_events=True,
     )
     await render()
+
+
+@app.get("/diagnostics")
+def diagnostics():
+    return {
+        "realtime": us_realtime.diagnostics(),
+        "cache": {
+            key: engine.meta(key)
+            for key in (
+                "markets", "macro", "futures", "fx",
+                "us_curve", "kr_curve", "us_heat", "kr_heat"
+            )
+        },
+    }
 
 
 @app.get("/health")

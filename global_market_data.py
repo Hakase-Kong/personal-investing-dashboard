@@ -579,3 +579,274 @@ def curve_compare_options(snapshots, title):
         },
         "series": series,
     }
+
+# ---------------------------------------------------------------------------
+# v1.3 performance overrides: batch Treasury fetches, fast ECOS curve fetch,
+# last-known-good Korean bond cache, and batched US extended-hours fallback.
+# ---------------------------------------------------------------------------
+import json as _json
+from pathlib import Path as _Path
+
+_KR_LKG_PATH = _Path(os.getenv("KR_BOND_LKG_FILE", "/tmp/my-market-kr-bonds.json"))
+
+
+def _load_kr_lkg():
+    try:
+        if _KR_LKG_PATH.exists():
+            return _json.loads(_KR_LKG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_kr_lkg(data):
+    try:
+        _KR_LKG_PATH.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _fred_batch(series_ids, years=2):
+    ids = ",".join(series_ids)
+    response = requests.get(
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={ids}",
+        timeout=12,
+    )
+    response.raise_for_status()
+    frame = pd.read_csv(StringIO(response.text))
+    date_col = frame.columns[0]
+    frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+    cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+    frame = frame[frame[date_col] >= cutoff].copy()
+    for col in frame.columns[1:]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame.rename(columns={date_col: "date"})
+
+
+def get_us_yield_curve():
+    def load():
+        series_ids = [series for series, _ in US_TREASURY]
+        try:
+            frame = _fred_batch(series_ids, 1)
+        except Exception:
+            return _CACHE.get("us-curve-v13-lkg", (0, []))[1] or [
+                {"tenor": tenor, "value": None, "series": series}
+                for series, tenor in US_TREASURY
+            ]
+        rows = []
+        for series, tenor in US_TREASURY:
+            values = pd.to_numeric(frame.get(series), errors="coerce").dropna() if series in frame else pd.Series(dtype=float)
+            value = float(values.iloc[-1]) if len(values) else None
+            rows.append({"tenor": tenor, "value": value, "series": series})
+        _CACHE["us-curve-v13-lkg"] = (time.time(), rows)
+        return rows
+    return _cached("us-curve-v13", 900, load)
+
+
+def _recent_kr_bond_rows(days=45):
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    start = today - timedelta(days=days)
+    return _ecos_stat_search(start=start, end=today, page_size=1000)
+
+
+def _extract_kr_tenor(name):
+    compact = str(name or "").replace(" ", "")
+    if "국고채" not in compact:
+        return None
+    for n in ("1", "2", "3", "5", "10", "20", "30"):
+        if f"국고채({n}년)" in compact or f"국고채{n}년" in compact:
+            return f"{n}Y"
+    return None
+
+
+def get_kr_yield_curve():
+    """Fetch the whole current Korean government curve in one ECOS request.
+
+    This avoids seven sequential HTTP requests. When ECOS is temporarily down,
+    the latest successful curve remains visible instead of turning into dashes.
+    """
+    def load():
+        lkg = _load_kr_lkg()
+        latest = {}
+        names = {}
+        series_codes = {}
+        try:
+            rows = _recent_kr_bond_rows(55)
+            for row in rows:
+                tenor = _extract_kr_tenor(row.get("ITEM_NAME1"))
+                if not tenor:
+                    continue
+                try:
+                    value = float(row.get("DATA_VALUE"))
+                except Exception:
+                    continue
+                dt = str(row.get("TIME") or "")
+                if tenor not in latest or dt >= latest[tenor][0]:
+                    latest[tenor] = (dt, value)
+                    names[tenor] = row.get("ITEM_NAME1") or f"국고채({tenor})"
+                    series_codes[tenor] = row.get("ITEM_CODE1")
+        except Exception:
+            pass
+
+        # Static-code fallback for stable tenors if the all-items search was partial.
+        for tenor, (code, static_name) in KR_BOND_STATIC.items():
+            if tenor in latest:
+                continue
+            try:
+                value = _ecos_latest("817Y002", code, lookback_days=55)
+                if value is not None:
+                    latest[tenor] = (datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d"), value)
+                    names[tenor] = static_name
+                    series_codes[tenor] = code
+            except Exception:
+                pass
+
+        result = []
+        saved = dict(lkg)
+        now_iso = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+        for tenor in ("1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y"):
+            if tenor in latest:
+                _, value = latest[tenor]
+                point = {
+                    "tenor": tenor,
+                    "value": value,
+                    "name": names.get(tenor, f"국고채({tenor})"),
+                    "series": series_codes.get(tenor),
+                    "stale": False,
+                    "updated_at": now_iso,
+                }
+                saved[tenor] = point
+            elif tenor in lkg:
+                point = dict(lkg[tenor])
+                point["stale"] = True
+            else:
+                point = {
+                    "tenor": tenor,
+                    "value": None,
+                    "name": f"국고채({tenor.replace('Y','년')})",
+                    "series": None,
+                    "stale": True,
+                    "updated_at": None,
+                }
+            result.append(point)
+
+        if any(x.get("value") is not None and not x.get("stale") for x in result):
+            _save_kr_lkg(saved)
+        return result
+
+    return _cached("kr-curve-v13", 600, load)
+
+
+def get_us_curve_history_matrix(years=5):
+    """One FRED request for all Treasury maturities."""
+    def load():
+        ids = [series for series, _ in US_TREASURY]
+        return _fred_batch(ids, years)
+    return _cached(f"us-curve-matrix:{years}", 1800, load)
+
+
+def get_kr_curve_history_matrix(years=5):
+    """Historical Korean curve matrix. Slow source, therefore heavily cached."""
+    def load():
+        tenors = ("1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y")
+        frames = []
+        for tenor in tenors:
+            frame = get_kr_bond_history(tenor, years)
+            if frame is None or frame.empty:
+                continue
+            f = frame[["date", "value"]].copy().rename(columns={"value": tenor})
+            frames.append(f)
+        if not frames:
+            return pd.DataFrame()
+        merged = frames[0]
+        for frame in frames[1:]:
+            merged = pd.merge(merged, frame, on="date", how="outer")
+        return merged.sort_values("date").ffill()
+    return _cached(f"kr-curve-matrix:{years}", 3600, load)
+
+
+def curve_at_date(country="us", target_date=None, years=5):
+    target = pd.Timestamp(target_date or datetime.now().date()).tz_localize(None)
+    if country == "us":
+        frame = get_us_curve_history_matrix(years)
+        mapping = {tenor: series for series, tenor in US_TREASURY}
+        tenors = [tenor for _, tenor in US_TREASURY]
+    else:
+        frame = get_kr_curve_history_matrix(years)
+        mapping = {t: t for t in ("1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y")}
+        tenors = list(mapping)
+    if frame is None or frame.empty:
+        return []
+    dates = pd.to_datetime(frame["date"]).dt.tz_localize(None)
+    subset = frame[dates <= target]
+    if subset.empty:
+        return []
+    row = subset.iloc[-1]
+    return [
+        {"tenor": tenor, "value": (None if pd.isna(row.get(mapping[tenor])) else float(row.get(mapping[tenor])))}
+        for tenor in tenors
+    ]
+
+
+def curve_available_dates(country="us", years=5):
+    frame = get_us_curve_history_matrix(years) if country == "us" else get_kr_curve_history_matrix(years)
+    if frame is None or frame.empty:
+        return []
+    return [d.strftime("%Y-%m-%d") for d in pd.to_datetime(frame["date"]).dropna().drop_duplicates().tolist()]
+
+
+def get_us_extended_batch(items):
+    """Batched 15-second fallback for US cards when WS has no recent tick."""
+    if not items:
+        return {}
+    symbols = [str(s).upper() for s, _ in items]
+
+    def load():
+        try:
+            frame = yf.download(
+                symbols,
+                period="1d",
+                interval="1m",
+                prepost=True,
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                group_by="column",
+            )
+        except Exception:
+            return {}
+        if frame is None or frame.empty:
+            return {}
+        now_session = "CLOSED"
+        now = datetime.now(ZoneInfo("America/New_York"))
+        hm = (now.hour, now.minute)
+        if now.weekday() < 5:
+            if (4, 0) <= hm < (9, 30):
+                now_session = "PRE"
+            elif (9, 30) <= hm < (16, 0):
+                now_session = "REGULAR"
+            elif (16, 0) <= hm < (20, 0):
+                now_session = "POST"
+
+        result = {}
+        for symbol in symbols:
+            try:
+                if isinstance(frame.columns, pd.MultiIndex):
+                    closes = pd.to_numeric(frame[("Close", symbol)], errors="coerce").dropna()
+                else:
+                    closes = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+                if closes.empty:
+                    continue
+                last = float(closes.iloc[-1])
+                result[symbol] = {
+                    "last": last,
+                    "premarket": last if now_session == "PRE" else None,
+                    "regular": last if now_session == "REGULAR" else None,
+                    "afterhours": last if now_session == "POST" else None,
+                    "session": now_session,
+                }
+            except Exception:
+                continue
+        return result
+
+    return _cached("us-extended-batch:" + ",".join(symbols), 12, load)
