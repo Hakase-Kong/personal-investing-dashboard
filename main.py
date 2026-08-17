@@ -23,6 +23,7 @@ from global_market_data import (
     get_us_spread_history,
     get_kr_spread_history,
     line_chart_options,
+    get_ecos_diagnostics,
 )
 from indicator_data import make_indicator_options, MARKET_LABELS, MACRO_LABELS
 from dashboard_data import (
@@ -36,6 +37,7 @@ from kr_master import load_master
 from market_data import get_us_quote, search_stocks
 from heatmap_data import get_us_heatmap, get_kr_heatmap, echart_treemap
 from realtime_market import USRealtimeHub
+from realtime_kr import KRRealtimeHub
 from news_data import (
     get_naver_news_for_watchlist, merge_news, naver_news_enabled,
 )
@@ -92,6 +94,11 @@ us_realtime = USRealtimeHub(
     os.getenv('KIS_APP_SECRET', ''),
     os.getenv('KIS_ENV', 'real'),
     fallback_provider=get_us_extended_batch,
+)
+kr_realtime = KRRealtimeHub(
+    os.getenv('KIS_APP_KEY', ''),
+    os.getenv('KIS_APP_SECRET', ''),
+    os.getenv('KIS_ENV', 'real'),
 )
 
 # Shared background cache. These feeds start warming when the Render process starts,
@@ -733,57 +740,53 @@ async def public_home():
 
     public_stock_refs = {}
 
-    def refresh_public_us_live():
-        if state.get("market") != "US":
-            return
+    def refresh_public_live():
+        current_market = state.get('market')
         for symbol, refs in list(public_stock_refs.items()):
-            snap = us_realtime.get(symbol)
-            session = snap.get("session", "CLOSED")
-            value = snap.get("display_last")
-            pct = snap.get("display_percent")
-            state_name = snap.get("state", "SUBSCRIBING")
-
+            hub = us_realtime if current_market == 'US' else kr_realtime
+            snap = hub.get(symbol)
+            value = snap.get('display_last')
+            pct = snap.get('display_percent')
             if value is not None:
-                refs["price"].set_text(f"${float(value):,.2f}")
+                refs['price'].set_text(
+                    f"${float(value):,.2f}" if current_market == 'US' else f"{float(value):,.0f}원"
+                )
             if pct is not None:
-                refs["pct"].set_text(f"{float(pct):+.2f}%")
-                refs["pct"].classes(remove="positive negative muted")
-                refs["pct"].classes(add=delta_class(float(pct)))
+                refs['pct'].set_text(f"{float(pct):+.2f}%")
+                refs['pct'].classes(remove='positive negative muted')
+                refs['pct'].classes(add=delta_class(float(pct)))
 
-            # The mini chart now follows today's PRE/REG/POST minute seed and
-            # then grows with KIS WebSocket ticks. Update only when the series
-            # changed so 12 cards do not redraw unnecessarily every second.
-            seq = int(snap.get("tick_seq", 0))
-            points = snap.get("live_points") or []
-            if points and seq != refs.get("tick_seq"):
-                chart = refs.get("spark_chart")
+            seq = int(snap.get('tick_seq', 0))
+            points = snap.get('live_points') or []
+            if points and seq != refs.get('tick_seq'):
+                chart = refs.get('spark_chart')
                 if chart is not None:
-                    options = live_spark_options(points, positive=(pct or 0) >= 0)
-                    chart.options.clear()
-                    chart.options.update(options)
-                    chart.update()
-                    refs["tick_seq"] = seq
+                    opts = live_spark_options(points, positive=(pct or 0) >= 0)
+                    chart.options.clear(); chart.options.update(opts); chart.update()
+                    refs['tick_seq'] = seq
 
-            session_short = {"PRE": "PRE", "REGULAR": "REG", "POST": "POST"}.get(session, session)
-            refs["session"].classes(remove="muted positive negative")
-            if state_name == "LIVE":
+            session = snap.get('session', 'CLOSED')
+            session_short = {
+                'PRE': '장전', 'REGULAR': '본장', 'CLOSING': '동시호가',
+                'AFTER': '시간외', 'POST': 'POST', 'CLOSED': '마감'
+            }.get(session, session)
+            refs['session'].classes(remove='muted positive negative')
+            if snap.get('state') == 'LIVE':
                 label = f"● {session_short} LIVE"
-                refs["session"].classes(add="positive" if (pct or 0) >= 0 else "negative")
-            elif state_name == "SNAPSHOT":
-                label = f"● {session_short} · SNAPSHOT"
-                refs["session"].classes(add="muted")
-            elif state_name == "ACKED":
+                refs['session'].classes(add='positive' if (pct or 0) >= 0 else 'negative')
+            elif current_market == 'US' and snap.get('state') == 'QUOTE':
+                label = f"● {session_short} QUOTE LIVE"
+                refs['session'].classes(add='positive' if (pct or 0) >= 0 else 'negative')
+            elif snap.get('state') in ('READY', 'ACKED'):
                 label = f"● {session_short} · WS READY"
-                refs["session"].classes(add="muted")
-            elif state_name == "ERROR":
+                refs['session'].classes(add='muted')
+            elif value is not None:
                 label = f"● {session_short} · SNAPSHOT"
-                refs["session"].classes(add="muted")
+                refs['session'].classes(add='muted')
             else:
-                # The snapshot task starts immediately, so this state should
-                # normally last only a moment and is no longer called 연결대기.
-                label = f"{session_short} · 시세 준비중" if session != "CLOSED" else ""
-                refs["session"].classes(add="muted")
-            refs["session"].set_text(label)
+                label = '' if session == 'CLOSED' else f'{session_short} · 시세 준비중'
+                refs['session'].classes(add='muted')
+            refs['session'].set_text(label)
 
     async def load_stocks():
         data = await asyncio.to_thread(
@@ -836,41 +839,39 @@ async def public_home():
                         "text-[10px] muted min-h-[16px] mt-1"
                     )
 
-                    spark_chart = None
-                    if item.get("market") == "US":
-                        # Start with the historical mini trend; the first shared
-                        # snapshot replaces it with today's intraday series and
-                        # WebSocket ticks keep extending it once per second.
-                        seed = [[i, v] for i, v in enumerate(item.get("spark") or [])]
-                        spark_chart = ui.echart(
-                            live_spark_options(seed, positive=(pct or 0) >= 0),
-                            renderer="canvas",
-                        ).classes("w-full h-[72px] mt-2")
-                    else:
-                        svg = mini_svg(item.get("spark") or [], height=58)
-                        if svg:
-                            ui.html(svg).classes("w-full mt-2")
+                    seed = [[i, v] for i, v in enumerate(item.get("spark") or [])]
+                    spark_chart = ui.echart(
+                        live_spark_options(seed, positive=(pct or 0) >= 0),
+                        renderer="canvas",
+                    ).classes("w-full h-[72px] mt-2")
                     ui.label("클릭해서 상세 차트").classes(
                         "text-[11px] soft mt-1"
                     )
 
-                    if item.get("market") == "US":
-                        public_stock_refs[item["symbol"]] = {
-                            "price": price_ref,
-                            "pct": pct_ref,
-                            "session": session_ref,
-                            "exchange": item.get("exchange", ""),
-                            "spark_chart": spark_chart,
-                            "tick_seq": -1,
-                        }
+                    public_stock_refs[item["symbol"]] = {
+                        "price": price_ref,
+                        "pct": pct_ref,
+                        "session": session_ref,
+                        "exchange": item.get("exchange", ""),
+                        "market": item.get("market", ""),
+                        "spark_chart": spark_chart,
+                        "tick_seq": -1,
+                    }
+                    if item.get("market") == "KR":
+                        kr_realtime.seed(
+                            item["symbol"], item.get("price"), item.get("percent"),
+                            item.get("change"), item.get("spark") or []
+                        )
 
-        if state["market"] == "US" and public_stock_refs:
-            await us_realtime.subscribe_many(
-                [(symbol, refs["exchange"]) for symbol, refs in public_stock_refs.items()]
-            )
-            # Let the websocket connect without making the whole stock grid wait.
+        if public_stock_refs:
+            if state["market"] == "US":
+                await us_realtime.subscribe_many(
+                    [(symbol, refs["exchange"]) for symbol, refs in public_stock_refs.items()]
+                )
+            else:
+                await kr_realtime.subscribe_many(list(public_stock_refs))
             await asyncio.sleep(0)
-            refresh_public_us_live()
+            refresh_public_live()
 
     async def choose_market(value):
         state["market"] = value
@@ -968,7 +969,7 @@ async def public_home():
     asyncio.create_task(load_news())
 
     ui.timer(30, load_markets)
-    ui.timer(1.0, refresh_public_us_live)
+    ui.timer(1.0, refresh_public_live)
     ui.timer(300, load_news)
 
 
@@ -1567,30 +1568,50 @@ async def personal_dashboard():
 
     async def refresh_watch_quotes():
         async def one(refs):
-            item = refs["item"]
-            try:
-                q = (
-                    await asyncio.to_thread(kis.get_domestic_quote, item["symbol"])
-                    if item["market"] == "KR"
-                    else await asyncio.to_thread(get_us_quote, item["symbol"])
-                )
-                price = q.get("price")
-                change = q.get("change")
-                pct = q.get("change_percent")
-                if q.get("currency") == "KRW":
-                    refs["price"].set_text("-" if price is None else f"{price:,.0f}원")
-                    refs["change"].set_text(
-                        "-" if change is None or pct is None
-                        else f"{change:+,.0f}원 ({pct:+.2f}%)"
+            item = refs['item']
+            hub = kr_realtime if item['market'] == 'KR' else us_realtime
+            snap = hub.get(item['symbol'])
+            price = snap.get('display_last')
+            pct = snap.get('display_percent')
+            change = snap.get('display_change')
+
+            # Initial/fallback REST only when the hub has no usable value.
+            if price is None:
+                try:
+                    q = (
+                        await asyncio.to_thread(kis.get_domestic_quote, item['symbol'])
+                        if item['market'] == 'KR'
+                        else await asyncio.to_thread(get_us_quote, item['symbol'])
                     )
-                else:
-                    refs["price"].set_text("-" if price is None else f"${price:,.2f}")
-                    refs["change"].set_text(
-                        "-" if change is None or pct is None
-                        else f"${change:+,.2f} ({pct:+.2f}%)"
-                    )
-            except Exception:
-                refs["price"].set_text("조회 실패")
+                    price = q.get('price'); change = q.get('change'); pct = q.get('change_percent')
+                    if item['market'] == 'KR' and price is not None:
+                        kr_realtime.seed(item['symbol'], price, pct, change)
+                except Exception:
+                    refs['price'].set_text('조회 실패')
+                    return
+
+            if item['market'] == 'KR':
+                refs['price'].set_text(f'{float(price):,.0f}원')
+                refs['change'].set_text('-' if change is None or pct is None else f'{float(change):+,.0f}원 ({float(pct):+.2f}%)')
+            else:
+                refs['price'].set_text(f'${float(price):,.2f}')
+                refs['change'].set_text('-' if change is None or pct is None else f'${float(change):+,.2f} ({float(pct):+.2f}%)')
+
+            seq = int(snap.get('tick_seq', 0))
+            points = snap.get('live_points') or []
+            if points and seq != refs.get('tick_seq'):
+                opts = live_spark_options(points, positive=(pct or 0) >= 0)
+                refs['spark_chart'].options.clear(); refs['spark_chart'].options.update(opts); refs['spark_chart'].update()
+                refs['tick_seq'] = seq
+
+            session = snap.get('session', '')
+            short = {'PRE':'장전','REGULAR':'본장','CLOSING':'동시호가','AFTER':'시간외','POST':'POST'}.get(session, session)
+            if snap.get('state') == 'LIVE':
+                refs['live_state'].set_text(f'● {short} LIVE')
+            elif snap.get('state') in ('QUOTE','READY','ACKED'):
+                refs['live_state'].set_text(f'● {short} · WS READY')
+            else:
+                refs['live_state'].set_text(f'● {short} · SNAPSHOT' if short else '')
 
         if quote_refs:
             await asyncio.gather(*(one(x) for x in quote_refs.values()))
@@ -1624,25 +1645,10 @@ async def personal_dashboard():
                         )
                         change = ui.label("-").classes("text-sm font-bold muted")
 
-                    spark_host = ui.column().classes(
-                        "w-full watch-spark mt-2 justify-center"
-                    )
-
-                    async def load_spark(current=item, host=spark_host):
-                        svg = await asyncio.to_thread(
-                            get_sparkline_svg,
-                            current["market"],
-                            current["exchange"],
-                            current["symbol"],
-                        )
-                        host.clear()
-                        with host:
-                            if svg:
-                                ui.html(svg).classes("w-full")
-                            else:
-                                ui.label("미니차트 없음").classes("text-xs soft")
-
-                    asyncio.create_task(load_spark())
+                    spark_chart = ui.echart(
+                        live_spark_options([], positive=True), renderer="canvas"
+                    ).classes("w-full watch-spark mt-2")
+                    live_state = ui.label("").classes("text-[10px] muted")
 
                     existing = next(
                         (
@@ -1701,12 +1707,21 @@ async def personal_dashboard():
                         "item": item,
                         "price": price,
                         "change": change,
+                        "spark_chart": spark_chart,
+                        "live_state": live_state,
+                        "tick_seq": -1,
                     }
 
+        kr_symbols = [x['item']['symbol'] for x in quote_refs.values() if x['item']['market'] == 'KR']
+        us_symbols = [(x['item']['symbol'], x['item']['exchange']) for x in quote_refs.values() if x['item']['market'] == 'US']
+        if kr_symbols:
+            await kr_realtime.subscribe_many(kr_symbols)
+        if us_symbols:
+            await us_realtime.subscribe_many(us_symbols)
         await refresh_watch_quotes()
 
     await render_watchlist()
-    ui.timer(REFRESH_SECONDS, refresh_watch_quotes)
+    ui.timer(1.0, refresh_watch_quotes)
 
     with portfolio_host:
         with ui.row().classes("w-full items-end justify-between"):
@@ -2401,10 +2416,13 @@ async def stock_detail(market: str, exchange: str, symbol: str):
     def render_extended_shell():
         extended_host.clear()
         extended_refs.clear()
-        if market != 'US':
-            return
         with extended_host:
-            for key, label in [('premarket','프리마켓'), ('regular','정규장'), ('afterhours','애프터마켓')]:
+            keys = (
+                [('premarket','프리마켓'), ('regular','정규장'), ('afterhours','애프터마켓')]
+                if market == 'US'
+                else [('expected','장전/동시호가'), ('regular','정규장'), ('after','시간외 단일가')]
+            )
+            for key, label in keys:
                 with ui.card().classes('surface px-4 py-3 min-w-[165px]'):
                     ui.label(label).classes('text-xs muted')
                     price = ui.label('-').classes('text-lg font-black main-text')
@@ -2424,7 +2442,7 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             price_label.set_text(f"${float(display_last):,.2f}")
             live_change = snap.get('display_change')
             live_pct = snap.get('display_percent')
-            prefix = 'LIVE' if snap.get('state') == 'LIVE' else 'SNAPSHOT'
+            prefix = {'LIVE': 'TRADE LIVE', 'QUOTE': 'QUOTE LIVE'}.get(snap.get('state'), 'SNAPSHOT')
             change_label.set_text(
                 prefix if live_change is None or live_pct is None
                 else f"${float(live_change):+,.2f} ({float(live_pct):+.2f}%) · {prefix}"
@@ -2444,7 +2462,8 @@ async def stock_detail(market: str, exchange: str, symbol: str):
                 delta_label.set_text('')
         session = snap.get('session','CLOSED')
         source_map = {
-            'LIVE': 'KIS WS LIVE',
+            'LIVE': 'KIS TRADE LIVE',
+            'QUOTE': 'KIS QUOTE LIVE',
             'SNAPSHOT': '3~5s SNAPSHOT',
             'ACKED': 'KIS WS READY',
             'ERROR': 'SNAPSHOT 사용중',
@@ -2453,23 +2472,60 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         source = source_map.get(snap.get('state'), snap.get('source','POLL'))
         extended_refs['session'].set_text(f'현재 세션: {session} · {source}')
 
-    async def load_extended_hours():
-        if market != 'US':
+    def refresh_kr_extended_from_cache():
+        if market != 'KR' or not extended_refs:
             return
-        try:
-            batch = await asyncio.to_thread(get_us_extended_batch, [(symbol, exchange)])
-            if batch.get(symbol):
-                us_realtime.seed_extended(symbol, batch[symbol])
-            else:
-                polled = await asyncio.to_thread(get_us_extended_session, symbol)
-                us_realtime.seed_extended(symbol, polled)
-        except Exception:
-            pass
-        try:
-            await us_realtime.subscribe(symbol, exchange)
-        except Exception:
-            pass
-        refresh_extended_from_cache()
+        snap = kr_realtime.get(symbol)
+        value = snap.get('display_last')
+        pct = snap.get('display_percent')
+        change = snap.get('display_change')
+        if value is not None:
+            price_label.set_text(f'{float(value):,.0f}원')
+            state_text = 'LIVE' if snap.get('state') == 'LIVE' else 'SNAPSHOT'
+            change_label.set_text(
+                state_text if change is None or pct is None
+                else f'{float(change):+,.0f}원 ({float(pct):+.2f}%) · {state_text}'
+            )
+        for key in ('expected','regular','after'):
+            p_label, d_label = extended_refs[key]
+            v = snap.get(key)
+            p_label.set_text('-' if v is None else f'{float(v):,.0f}원')
+            d_label.set_text('LIVE' if snap.get('live') and (
+                (key == 'expected' and snap.get('session') in ('PRE','CLOSING')) or
+                (key == 'regular' and snap.get('session') == 'REGULAR') or
+                (key == 'after' and snap.get('session') == 'AFTER')
+            ) else '')
+        session = snap.get('session', 'CLOSED')
+        names = {'PRE':'장전 예상체결','REGULAR':'정규장','CLOSING':'장마감 동시호가','AFTER':'시간외 단일가','CLOSED':'마감'}
+        extended_refs['session'].set_text(f"현재 세션: {names.get(session, session)} · KIS {snap.get('state','SNAPSHOT')}")
+
+    async def load_extended_hours():
+        if market == 'US':
+            try:
+                batch = await asyncio.to_thread(get_us_extended_batch, [(symbol, exchange)])
+                if batch.get(symbol):
+                    us_realtime.seed_extended(symbol, batch[symbol])
+                else:
+                    polled = await asyncio.to_thread(get_us_extended_session, symbol)
+                    us_realtime.seed_extended(symbol, polled)
+            except Exception:
+                pass
+            try:
+                await us_realtime.subscribe(symbol, exchange)
+            except Exception:
+                pass
+            refresh_extended_from_cache()
+        else:
+            try:
+                q = await asyncio.to_thread(kis.get_domestic_quote, symbol)
+                kr_realtime.seed(symbol, q.get('price'), q.get('change_percent'), q.get('change'))
+            except Exception:
+                pass
+            try:
+                await kr_realtime.subscribe(symbol)
+            except Exception:
+                pass
+            refresh_kr_extended_from_cache()
 
     chart_lock = asyncio.Lock()
 
@@ -2513,8 +2569,8 @@ async def stock_detail(market: str, exchange: str, symbol: str):
     render_extended_shell()
     await asyncio.gather(load_quote(), load_extended_hours(), load_chart())
     ui.timer(REFRESH_SECONDS, load_quote)
+    ui.timer(1.0, lambda: refresh_extended_from_cache() if market == 'US' else refresh_kr_extended_from_cache())
     if market == 'US':
-        ui.timer(1.0, refresh_extended_from_cache)
         ui.timer(15.0, load_extended_hours)
 
 
@@ -2637,6 +2693,8 @@ async def indicator_detail(kind: str, code: str):
 def diagnostics():
     return {
         "realtime": us_realtime.diagnostics(),
+        "kr_realtime": kr_realtime.diagnostics(),
+        "ecos": get_ecos_diagnostics(),
         "cache": {
             key: engine.meta(key)
             for key in (
