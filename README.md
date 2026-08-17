@@ -355,3 +355,73 @@ US data is based on FRED H.15 series. Korea history uses ECOS 817Y002 and works 
 - KIS WebSocket mapping uses DNAS for NASDAQ, DAMS for AMEX and DNYS as the NYSE/ARCA-family fallback, based on KIS sample conventions.
 - If WebSocket registration is rejected for a particular exchange code, the UI continues with the polling fallback instead of failing the stock page.
 - The heatmap is a market overview visualization, not a complete exchange-wide commercial market-data feed.
+
+## v1.2 Live Cards + Historical Yield Curves
+
+### US representative cards now follow KIS realtime
+When the public page is showing US representative stocks, v1.2 subscribes the visible symbols in one batch to the shared `HDFSCNT0` websocket hub.
+
+The card price and change update once per second from the shared cache and display a session badge:
+
+```text
+● PRE LIVE
+● REG LIVE
+● POST LIVE
+```
+
+The stock detail headline price is also synchronized to the same live PRE/REG/POST trade cache. The 15-second extended-hours poll remains as a fallback.
+
+### Websocket reliability
+`realtime_market.py` now:
+
+- batches subscriptions with `subscribe_many`
+- restarts the socket only once when the subscription set changes
+- automatically reconnects with exponential backoff
+- parses the official 26-field HDFSCNT0 overseas trade payload
+- keeps PRE / REGULAR / POST prices separately
+
+A single Render process shares the feed between users. This is still an in-memory design; multiple Render workers would need Redis/pub-sub or another shared realtime layer.
+
+### Korean Treasury fix
+The old implementation depended on `StatisticItemList`, which is unreliable with the ECOS `sample` key. v1.2 instead:
+
+1. uses known stable 817Y002 item codes for 1Y / 3Y / 5Y / 10Y / 20Y
+2. discovers additional tenors such as 2Y / 30Y from recent `StatisticSearch` observations when available
+3. paginates historical ECOS series rather than requesting an oversized single page
+
+For reliable 2Y / 30Y and long-history access, set a real `ECOS_API_KEY` in Render.
+
+### Bonds UI
+The Bond tab is now split into:
+
+```text
+[ 현재 YC ] [ YC 변화 ] [ 스프레드 ]
+```
+
+`현재 YC`
+- US and Korea current yield curves
+- click any maturity to open its historical chart
+
+`YC 변화`
+- current
+- 1 month ago
+- 3 months ago
+- 1 year ago
+
+All four curves are overlaid so curve flattening, steepening and inversion can be compared visually.
+
+`스프레드`
+- US 10Y-2Y preview chart directly in the tab
+- Korea 10Y-2Y preview when Korean 2Y is available
+- detail chart buttons
+
+### No Supabase migration
+v1.2 does not change the database schema.
+
+### Recommended Render environment variable
+
+```text
+ECOS_API_KEY=<your Bank of Korea ECOS API key>
+```
+
+The rest of the environment variables are unchanged from v1.1.

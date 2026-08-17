@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from nicegui import app, ui
 
 from chart_data import get_echart_options
+from bond_ui import render_bond_panel
 from global_market_data import (
     get_futures_snapshot,
     get_fx_snapshot,
@@ -18,6 +19,7 @@ from global_market_data import (
     get_us_bond_history,
     get_kr_bond_history,
     get_us_spread_history,
+    get_kr_spread_history,
     line_chart_options,
 )
 from indicator_data import make_indicator_options, MARKET_LABELS, MACRO_LABELS
@@ -660,34 +662,7 @@ async def public_home():
         render_cards(public_futures, futures, lambda x: f"{x['value']:,.2f}")
         render_cards(public_fx, fx, lambda x: f"{x['value']:,.4f}" if abs(x['value']) < 100 else f"{x['value']:,.2f}")
 
-        public_bonds.clear()
-        with public_bonds:
-            with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
-                for country, title, curve in [("us", "미국 국채 수익률", us_curve), ("kr", "한국 국고채 수익률", kr_curve)]:
-                    with ui.card().classes("surface p-5"):
-                        ui.label(title).classes("font-bold main-text")
-                        categories = [x.get('tenor') for x in curve]
-                        values = [x.get('value') for x in curve]
-                        ui.echart({
-                            'animation': False,
-                            'grid': {'left': 48, 'right': 15, 'top': 22, 'bottom': 36},
-                            'xAxis': {'type': 'category', 'data': categories, 'axisLabel': {'color': '#94a3b8'}},
-                            'yAxis': {'type': 'value', 'scale': True, 'axisLabel': {'formatter': '{value}%', 'color': '#94a3b8'}},
-                            'series': [{'type': 'line', 'data': values, 'smooth': True, 'symbolSize': 7}],
-                            'tooltip': {'trigger': 'axis'},
-                        }, renderer='canvas').classes('w-full h-[220px]')
-                        with ui.row().classes('w-full gap-2 flex-wrap mt-2'):
-                            for point in curve:
-                                tenor = point.get('tenor')
-                                ui.button(
-                                    tenor,
-                                    on_click=lambda _, c=country, t=tenor: ui.navigate.to(f'/bond/{c}/{t}'),
-                                ).props('outline dense no-caps').classes('text-xs')
-
-            with ui.card().classes('surface p-5'):
-                ui.label('미국 장단기 금리차').classes('font-bold main-text')
-                ui.label('10Y-2Y 스프레드 역사차트').classes('text-xs muted mb-2')
-                ui.button('10Y-2Y 차트 보기', icon='show_chart', on_click=lambda: ui.navigate.to('/bond/spread/10Y-2Y')).props('outline no-caps')
+        await render_bond_panel(public_bonds, us_curve, kr_curve)
 
         public_heatmap.clear()
         with public_heatmap:
@@ -715,6 +690,40 @@ async def public_home():
             if active:
                 button.classes(add="filter-active")
 
+    public_stock_refs = {}
+
+    def refresh_public_us_live():
+        if state.get("market") != "US":
+            return
+        for symbol, refs in list(public_stock_refs.items()):
+            snap = us_realtime.get(symbol)
+            session = snap.get("session", "CLOSED")
+            live = snap.get("live", False)
+            value = snap.get("last")
+            pct = snap.get("percent")
+            change = snap.get("change")
+
+            if live and value is not None:
+                refs["price"].set_text(f"${value:,.2f}")
+                refs["pct"].set_text("-" if pct is None else f"{pct:+.2f}%")
+                refs["pct"].classes(remove="positive negative muted")
+                refs["pct"].classes(add=delta_class(pct))
+                session_text = {
+                    "PRE": "● PRE LIVE",
+                    "REGULAR": "● REG LIVE",
+                    "POST": "● POST LIVE",
+                }.get(session, "● LIVE")
+                refs["session"].set_text(session_text)
+                refs["session"].classes(remove="muted positive negative")
+                refs["session"].classes(add="positive" if (pct or 0) >= 0 else "negative")
+            else:
+                current = USRealtimeHub.session_now()
+                refs["session"].set_text(
+                    "" if current == "CLOSED" else f"{current} · 연결 대기"
+                )
+                refs["session"].classes(remove="positive negative")
+                refs["session"].classes(add="muted")
+
     async def load_stocks():
         data = await asyncio.to_thread(
             get_representative_stocks,
@@ -724,10 +733,12 @@ async def public_home():
             kis=kis,
         )
         stock_grid.clear()
+        public_stock_refs.clear()
+
         with stock_grid:
             for item in data:
                 with ui.card().classes(
-                    "surface stock-card p-5 min-h-[220px]"
+                    "surface stock-card p-5 min-h-[235px]"
                 ) as card:
                     card.on(
                         "click",
@@ -740,31 +751,52 @@ async def public_home():
                     with ui.row().classes(
                         "w-full items-start justify-between"
                     ):
-                        with ui.column().classes("gap-0"):
+                        with ui.column().classes("gap-0 min-w-0"): 
                             ui.label(item["name"]).classes(
-                                "font-bold main-text text-lg"
+                                "font-bold main-text text-lg leading-snug line-clamp-2 min-h-[44px]"
                             )
                             ui.label(
                                 f"{item['symbol']} · {item['exchange']}"
                             ).classes("text-xs muted")
                         ui.label(item["market"]).classes(
-                            "pill text-[10px] font-bold"
+                            "pill text-[10px] font-bold shrink-0"
                         )
-                    ui.label(stock_price_text(item)).classes(
+
+                    price_ref = ui.label(stock_price_text(item)).classes(
                         "text-2xl font-black main-text mt-3"
                     )
                     pct = item.get("percent")
-                    ui.label(
+                    pct_ref = ui.label(
                         "-" if pct is None else f"{pct:+.2f}%"
                     ).classes(
                         f"text-sm font-bold {delta_class(pct)}"
                     )
+                    session_ref = ui.label("").classes(
+                        "text-[10px] muted min-h-[16px] mt-1"
+                    )
+
                     svg = mini_svg(item.get("spark") or [], height=58)
                     if svg:
-                        ui.html(svg).classes("w-full mt-3")
+                        ui.html(svg).classes("w-full mt-2")
                     ui.label("클릭해서 상세 차트").classes(
                         "text-[11px] soft mt-1"
                     )
+
+                    if item.get("market") == "US":
+                        public_stock_refs[item["symbol"]] = {
+                            "price": price_ref,
+                            "pct": pct_ref,
+                            "session": session_ref,
+                            "exchange": item.get("exchange", ""),
+                        }
+
+        if state["market"] == "US" and public_stock_refs:
+            await us_realtime.subscribe_many(
+                [(symbol, refs["exchange"]) for symbol, refs in public_stock_refs.items()]
+            )
+            # Let the websocket connect without making the whole stock grid wait.
+            await asyncio.sleep(0)
+            refresh_public_us_live()
 
     async def choose_market(value):
         state["market"] = value
@@ -863,6 +895,7 @@ async def public_home():
     )
 
     ui.timer(60, load_markets)
+    ui.timer(1.0, refresh_public_us_live)
     ui.timer(300, load_news)
 
 
@@ -2111,30 +2144,7 @@ async def personal_dashboard():
                         ui.label(text_value).classes("text-xl font-black main-text")
                         pct=item.get("percent")
                         if pct is not None: ui.label(f"{pct:+.2f}%").classes(f"text-xs font-bold {delta_class(pct)}")
-            bonds_host2.clear()
-            with bonds_host2:
-                with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
-                    for country, title, curve in [("us", "미국 국채", us_curve), ("kr", "한국 국고채", kr_curve)]:
-                        with ui.card().classes("surface p-5"):
-                            ui.label(title).classes("font-bold main-text")
-                            ui.label("만기별 수익률 곡선 · 만기를 누르면 역사차트").classes("text-xs muted")
-                            categories=[x.get("tenor") for x in curve]
-                            values=[x.get("value") for x in curve]
-                            ui.echart({
-                                "animation": False,
-                                "grid": {"left": 45, "right": 15, "top": 30, "bottom": 35},
-                                "xAxis": {"type": "category", "data": categories, "axisLabel": {"color": "#94a3b8"}},
-                                "yAxis": {"type": "value", "scale": True, "axisLabel": {"formatter": "{value}%", "color": "#94a3b8"}},
-                                "series": [{"type": "line", "data": values, "smooth": True, "symbolSize": 7}],
-                                "tooltip": {"trigger": "axis"},
-                            }, renderer="canvas").classes("w-full h-[280px]")
-                            with ui.row().classes('w-full gap-2 flex-wrap mt-2'):
-                                for point in curve:
-                                    tenor=point.get('tenor')
-                                    ui.button(tenor, on_click=lambda _, c=country, t=tenor: ui.navigate.to(f'/bond/{c}/{t}')).props('outline dense no-caps')
-                with ui.card().classes('surface p-5'):
-                    ui.label('Yield Spread').classes('font-bold main-text')
-                    ui.button('US 10Y-2Y', icon='show_chart', on_click=lambda: ui.navigate.to('/bond/spread/10Y-2Y')).props('outline no-caps')
+            await render_bond_panel(bonds_host2, us_curve, kr_curve)
             heatmap_host2.clear()
             with heatmap_host2:
                 with ui.tabs().classes('w-full dashboard-tabs') as personal_hm_tabs:
@@ -2332,6 +2342,17 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         if market != 'US' or not extended_refs:
             return
         snap = us_realtime.get(symbol)
+
+        # Keep the headline price synchronized with the live PRE/REG/POST trade.
+        if snap.get('live') and snap.get('last') is not None:
+            price_label.set_text(f"${float(snap['last']):,.2f}")
+            live_change = snap.get('change')
+            live_pct = snap.get('percent')
+            change_label.set_text(
+                'LIVE' if live_change is None or live_pct is None
+                else f"${float(live_change):+,.2f} ({float(live_pct):+.2f}%)"
+            )
+
         for key in ('premarket','regular','afterhours'):
             price_label, delta_label = extended_refs[key]
             value = snap.get(key)
@@ -2421,7 +2442,12 @@ async def bond_detail(country: str, tenor: str):
             ui.button('시장 홈', icon='public', on_click=lambda: ui.navigate.to('/')).props('flat no-caps')
 
     is_spread = country == 'spread'
-    title_text = f'US {tenor} Treasury Yield' if country == 'us' else f'한국 국고채 {tenor}' if country == 'kr' else f'US Yield Spread {tenor}'
+    title_text = (
+        f'US {tenor} Treasury Yield' if country == 'us'
+        else f'한국 국고채 {tenor}' if country == 'kr'
+        else f'한국 Yield Spread {tenor.replace("KR-", "")}' if tenor.startswith('KR-')
+        else f'US Yield Spread {tenor}'
+    )
     ui.label(title_text).classes('text-3xl font-black main-text mt-5')
     ui.label('만기별 금리의 역사적 흐름을 확인합니다.').classes('text-sm muted')
     years = ui.toggle({1:'1년',3:'3년',5:'5년',10:'10년'}, value=5).props('unelevated').classes('mt-5')
@@ -2438,6 +2464,10 @@ async def bond_detail(country: str, tenor: str):
             elif country == 'kr':
                 frame = await asyncio.to_thread(get_kr_bond_history, tenor, int(years.value))
                 chart_title = f'Korea Treasury {tenor}'
+            elif tenor.startswith('KR-'):
+                clean_tenor = tenor.replace('KR-', '', 1)
+                frame = await asyncio.to_thread(get_kr_spread_history, clean_tenor, int(years.value))
+                chart_title = f'Korea Spread {clean_tenor}'
             else:
                 frame = await asyncio.to_thread(get_us_spread_history, tenor, int(years.value))
                 chart_title = f'US Spread {tenor}'

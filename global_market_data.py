@@ -364,3 +364,218 @@ def line_chart_options(frame, title, suffix='%'):
             'smooth': False, 'lineStyle': {'width': 2}, 'areaStyle': {'opacity': .05},
         }],
     }
+
+# ---------------------------------------------------------------------------
+# v1.2 robust Korea bond data + historical yield-curve snapshots
+# ---------------------------------------------------------------------------
+
+KR_BOND_STATIC = {
+    # Stable ECOS 817Y002 item codes documented in long-running ECOS examples.
+    "1Y": ("010190000", "국고채(1년)"),
+    "3Y": ("010200000", "국고채(3년)"),
+    "5Y": ("010200001", "국고채(5년)"),
+    "10Y": ("010210000", "국고채(10년)"),
+    "20Y": ("010220000", "국고채(20년)"),
+}
+
+
+def _ecos_stat_search(item_code=None, start=None, end=None, page_size=1000):
+    """Fetch ECOS 817Y002 with pagination.
+
+    `StatisticItemList` is not reliably available with the public `sample` key,
+    while `StatisticSearch` is. Therefore v1.2 discovers unknown tenors from
+    actual recent observations and uses stable static codes where known.
+    """
+    key = _ecos_key()
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    end = end or today
+    start = start or (end - timedelta(days=45))
+
+    def url_for(a, b):
+        base = (
+            f"https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/{a}/{b}/"
+            f"817Y002/D/{start:%Y%m%d}/{end:%Y%m%d}"
+        )
+        if item_code:
+            base += f"/{item_code}"
+        return base
+
+    first = requests.get(url_for(1, page_size), timeout=12)
+    first.raise_for_status()
+    body = first.json()
+    block = body.get("StatisticSearch") or {}
+    rows = list(block.get("row") or [])
+    total = int(block.get("list_total_count") or len(rows))
+
+    for offset in range(page_size + 1, total + 1, page_size):
+        last = min(offset + page_size - 1, total)
+        response = requests.get(url_for(offset, last), timeout=12)
+        response.raise_for_status()
+        rows.extend((response.json().get("StatisticSearch") or {}).get("row") or [])
+    return rows
+
+
+def _kr_item_map():
+    cached = _CACHE.get("kr-item-map-v12")
+    if cached and time.time() - cached[0] < 86400:
+        return cached[1]
+
+    mapping = dict(KR_BOND_STATIC)
+    try:
+        rows = _ecos_stat_search(start=datetime.now(ZoneInfo("Asia/Seoul")).date() - timedelta(days=20))
+        for row in rows:
+            code = str(row.get("ITEM_CODE1") or "")
+            name = str(row.get("ITEM_NAME1") or "").replace(" ", "")
+            for tenor in ("1", "2", "3", "5", "10", "20", "30"):
+                if f"국고채({tenor}년)" in name and code:
+                    mapping[f"{tenor}Y"] = (code, row.get("ITEM_NAME1") or f"국고채({tenor}년)")
+    except Exception:
+        pass
+
+    _CACHE["kr-item-map-v12"] = (time.time(), mapping)
+    return mapping
+
+
+def _kr_item(tenor):
+    return _kr_item_map().get(tenor, (None, f"국고채({tenor.replace('Y', '년')})"))
+
+
+def get_kr_bond_history(tenor="10Y", years=5):
+    def load():
+        code, _ = _kr_item(tenor)
+        if not code:
+            return pd.DataFrame(columns=["date", "value"])
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        start = today - timedelta(days=int(365.25 * years) + 45)
+        try:
+            rows = _ecos_stat_search(code, start=start, end=today)
+        except Exception:
+            return pd.DataFrame(columns=["date", "value"])
+
+        data = []
+        for row in rows:
+            try:
+                data.append(
+                    {
+                        "date": pd.to_datetime(row.get("TIME"), format="%Y%m%d", errors="coerce"),
+                        "value": float(row.get("DATA_VALUE")),
+                    }
+                )
+            except Exception:
+                pass
+        if not data:
+            return pd.DataFrame(columns=["date", "value"])
+        return pd.DataFrame(data).dropna().drop_duplicates("date").sort_values("date")
+
+    return _cached(f"kr-bond-history-v12:{tenor}:{years}", 1800, load)
+
+
+def get_kr_yield_curve():
+    def load():
+        result = []
+        for tenor in ("1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y"):
+            code, name = _kr_item(tenor)
+            value = None
+            if code:
+                try:
+                    frame = get_kr_bond_history(tenor, 1)
+                    if not frame.empty:
+                        value = float(frame["value"].iloc[-1])
+                except Exception:
+                    pass
+            result.append({"tenor": tenor, "value": value, "name": name, "series": code})
+        return result
+
+    return _cached("kr-curve-v12", 1200, load)
+
+
+def _value_on_or_before(frame, target_date):
+    if frame is None or frame.empty:
+        return None
+    target = pd.Timestamp(target_date).tz_localize(None)
+    dates = pd.to_datetime(frame["date"]).dt.tz_localize(None)
+    subset = frame[dates <= target]
+    if subset.empty:
+        return None
+    return float(subset["value"].iloc[-1])
+
+
+def get_us_curve_snapshots():
+    """Current, 1M, 3M and 1Y ago US Treasury curves."""
+    def load():
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        offsets = [("현재", 0), ("1개월 전", 30), ("3개월 전", 90), ("1년 전", 365)]
+        histories = {tenor: _fred_history(series, 2) for series, tenor in US_TREASURY}
+        snapshots = []
+        for label, days in offsets:
+            target = today - timedelta(days=days)
+            points = []
+            for _, tenor in US_TREASURY:
+                points.append({"tenor": tenor, "value": _value_on_or_before(histories[tenor], target)})
+            snapshots.append({"label": label, "date": target.isoformat(), "points": points})
+        return snapshots
+    return _cached("us-curve-snapshots-v12", 1800, load)
+
+
+def get_kr_curve_snapshots():
+    """Current, 1M, 3M and 1Y ago Korean Treasury curves."""
+    def load():
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        offsets = [("현재", 0), ("1개월 전", 30), ("3개월 전", 90), ("1년 전", 365)]
+        tenors = ("1Y", "2Y", "3Y", "5Y", "10Y", "20Y", "30Y")
+        histories = {tenor: get_kr_bond_history(tenor, 2) for tenor in tenors}
+        snapshots = []
+        for label, days in offsets:
+            target = today - timedelta(days=days)
+            points = []
+            for tenor in tenors:
+                points.append({"tenor": tenor, "value": _value_on_or_before(histories[tenor], target)})
+            snapshots.append({"label": label, "date": target.isoformat(), "points": points})
+        return snapshots
+    return _cached("kr-curve-snapshots-v12", 1800, load)
+
+
+def get_kr_spread_history(spread="10Y-2Y", years=5):
+    if spread != "10Y-2Y":
+        return pd.DataFrame(columns=["date", "value"])
+    left = get_kr_bond_history("10Y", years)
+    right = get_kr_bond_history("2Y", years)
+    if left.empty or right.empty:
+        return pd.DataFrame(columns=["date", "value"])
+    merged = pd.merge(left, right, on="date", how="inner", suffixes=("_10y", "_2y"))
+    merged["value"] = merged["value_10y"] - merged["value_2y"]
+    return merged[["date", "value"]]
+
+
+def curve_compare_options(snapshots, title):
+    if not snapshots:
+        return None
+    categories = [p["tenor"] for p in snapshots[0].get("points", [])]
+    series = []
+    for snap in snapshots:
+        series.append(
+            {
+                "name": f"{snap['label']} ({snap['date']})",
+                "type": "line",
+                "smooth": True,
+                "symbolSize": 7,
+                "connectNulls": False,
+                "data": [p.get("value") for p in snap.get("points", [])],
+            }
+        )
+    return {
+        "animation": False,
+        "backgroundColor": "transparent",
+        "title": {"text": title, "left": 12, "top": 8, "textStyle": {"color": "#e2e8f0", "fontSize": 15}},
+        "tooltip": {"trigger": "axis"},
+        "legend": {"top": 34, "textStyle": {"color": "#94a3b8"}},
+        "grid": {"left": 55, "right": 22, "top": 82, "bottom": 42},
+        "xAxis": {"type": "category", "data": categories, "axisLabel": {"color": "#94a3b8"}},
+        "yAxis": {
+            "type": "value",
+            "scale": True,
+            "axisLabel": {"formatter": "{value}%", "color": "#94a3b8"},
+            "splitLine": {"lineStyle": {"color": "rgba(100,116,139,.13)"}},
+        },
+        "series": series,
+    }
