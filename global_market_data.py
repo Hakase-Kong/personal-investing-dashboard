@@ -259,3 +259,108 @@ def get_us_extended_session(symbol):
         return {"premarket": pre, "regular": regular, "afterhours": post, "session": session}
 
     return _cached(f"extended:{symbol}", 30, load)
+
+
+US_BOND_SERIES = {tenor: series for series, tenor in US_TREASURY}
+
+
+def _fred_history(series_id, years=5):
+    response = requests.get(
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}",
+        timeout=10,
+    )
+    response.raise_for_status()
+    frame = pd.read_csv(StringIO(response.text))
+    date_col, value_col = frame.columns[0], frame.columns[-1]
+    result = pd.DataFrame({
+        'date': pd.to_datetime(frame[date_col], errors='coerce'),
+        'value': pd.to_numeric(frame[value_col], errors='coerce'),
+    }).dropna()
+    cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+    return result[result['date'] >= cutoff]
+
+
+def get_us_bond_history(tenor='10Y', years=5):
+    series = US_BOND_SERIES.get(tenor, 'DGS10')
+    return _cached(
+        f'us-bond-history:{series}:{years}', 1800,
+        lambda: _fred_history(series, years),
+    )
+
+
+def _find_kr_item(tenor):
+    korean = tenor.replace('Y', '년')
+    for code, name in _ecos_items():
+        compact = name.replace(' ', '')
+        if '국고채' in compact and korean in compact:
+            return code, name
+    return None, f'국고채({korean})'
+
+
+def get_kr_bond_history(tenor='10Y', years=5):
+    def load():
+        code, name = _find_kr_item(tenor)
+        if not code:
+            return pd.DataFrame(columns=['date', 'value'])
+        key = _ecos_key()
+        today = datetime.now(ZoneInfo('Asia/Seoul')).date()
+        start = today - timedelta(days=int(365.25 * years) + 20)
+        url = (
+            f'https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/1/10000/'
+            f'817Y002/D/{start:%Y%m%d}/{today:%Y%m%d}/{code}/'
+        )
+        response = requests.get(url, timeout=12)
+        response.raise_for_status()
+        rows = (response.json().get('StatisticSearch') or {}).get('row') or []
+        data = []
+        for row in rows:
+            try:
+                data.append({
+                    'date': pd.to_datetime(row.get('TIME'), format='%Y%m%d', errors='coerce'),
+                    'value': float(row.get('DATA_VALUE')),
+                })
+            except Exception:
+                pass
+        return pd.DataFrame(data).dropna().sort_values('date') if data else pd.DataFrame(columns=['date','value'])
+    return _cached(f'kr-bond-history:{tenor}:{years}', 1800, load)
+
+
+def get_us_spread_history(spread='10Y-2Y', years=10):
+    mapping = {'10Y-2Y': 'T10Y2Y', '10Y-3M': 'T10Y3M'}
+    series = mapping.get(spread, 'T10Y2Y')
+    return _cached(
+        f'us-spread:{series}:{years}', 1800,
+        lambda: _fred_history(series, years),
+    )
+
+
+def line_chart_options(frame, title, suffix='%'):
+    if frame is None or frame.empty:
+        return None
+    labels = [d.strftime('%Y-%m-%d') for d in pd.to_datetime(frame['date'])]
+    values = [round(float(v), 4) for v in frame['value']]
+    return {
+        'animation': False,
+        'backgroundColor': 'transparent',
+        'title': {'text': title, 'left': 12, 'top': 8, 'textStyle': {'color': '#e2e8f0', 'fontSize': 15}},
+        'tooltip': {'trigger': 'axis'},
+        'grid': {'left': 58, 'right': 22, 'top': 52, 'bottom': 50},
+        'xAxis': {
+            'type': 'category', 'data': labels,
+            'axisLabel': {'color': '#64748b', 'hideOverlap': True},
+            'axisLine': {'lineStyle': {'color': '#334155'}},
+        },
+        'yAxis': {
+            'type': 'value', 'scale': True,
+            'axisLabel': {'color': '#64748b', 'formatter': '{value}' + suffix},
+            'splitLine': {'lineStyle': {'color': 'rgba(100,116,139,.13)'}},
+        },
+        'dataZoom': [
+            {'type': 'inside', 'start': 0, 'end': 100},
+            {'type': 'slider', 'bottom': 8, 'height': 17, 'borderColor': 'transparent'},
+        ],
+        'series': [{
+            'type': 'line', 'data': values, 'showSymbol': False,
+            'smooth': False, 'lineStyle': {'width': 2}, 'areaStyle': {'opacity': .05},
+        }],
+    }

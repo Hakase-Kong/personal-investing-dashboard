@@ -15,6 +15,10 @@ from global_market_data import (
     get_us_yield_curve,
     get_kr_yield_curve,
     get_us_extended_session,
+    get_us_bond_history,
+    get_kr_bond_history,
+    get_us_spread_history,
+    line_chart_options,
 )
 from indicator_data import make_indicator_options, MARKET_LABELS, MACRO_LABELS
 from dashboard_data import (
@@ -26,6 +30,8 @@ from dashboard_data import (
 from kis import KISClient
 from kr_master import load_master
 from market_data import get_us_quote, search_stocks
+from heatmap_data import get_us_heatmap, get_kr_heatmap, echart_treemap
+from realtime_market import USRealtimeHub
 from news_data import (
     get_naver_news_for_watchlist, merge_news, naver_news_enabled,
 )
@@ -77,6 +83,12 @@ kis = KISClient(
     os.getenv("KIS_APP_SECRET", ""),
     os.getenv("KIS_ENV", "real"),
 )
+us_realtime = USRealtimeHub(
+    os.getenv('KIS_APP_KEY', ''),
+    os.getenv('KIS_APP_SECRET', ''),
+    os.getenv('KIS_ENV', 'real'),
+)
+
 
 
 def add_style():
@@ -527,6 +539,7 @@ async def public_home():
             futures_tab = ui.tab("선물", icon="candlestick_chart")
             fx_tab = ui.tab("환율", icon="currency_exchange")
             bonds_tab = ui.tab("채권", icon="timeline")
+            heatmap_tab = ui.tab("히트맵", icon="grid_view")
         with ui.tab_panels(global_tabs, value=futures_tab).classes("w-full bg-transparent"):
             with ui.tab_panel(futures_tab).classes("p-0"):
                 public_futures = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
@@ -534,6 +547,8 @@ async def public_home():
                 public_fx = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
             with ui.tab_panel(bonds_tab).classes("p-0"):
                 public_bonds = ui.column().classes("w-full mt-3 gap-4")
+            with ui.tab_panel(heatmap_tab).classes("p-0"):
+                public_heatmap = ui.column().classes("w-full mt-3 gap-4")
 
     with stocks_host:
         ui.label("오늘의 대표 종목").classes("section-title")
@@ -618,11 +633,13 @@ async def public_home():
                         ui.html(svg).classes("w-full mt-2")
 
     async def load_global_snapshot():
-        futures, fx, us_curve, kr_curve = await asyncio.gather(
+        futures, fx, us_curve, kr_curve, us_heat, kr_heat = await asyncio.gather(
             asyncio.to_thread(get_futures_snapshot),
             asyncio.to_thread(get_fx_snapshot),
             asyncio.to_thread(get_us_yield_curve),
             asyncio.to_thread(get_kr_yield_curve),
+            asyncio.to_thread(get_us_heatmap),
+            asyncio.to_thread(get_kr_heatmap, kis, 24),
         )
 
         def render_cards(host, rows, value_fmt):
@@ -646,15 +663,45 @@ async def public_home():
         public_bonds.clear()
         with public_bonds:
             with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
-                for title, curve in [("미국 국채 수익률", us_curve), ("한국 국고채 수익률", kr_curve)]:
+                for country, title, curve in [("us", "미국 국채 수익률", us_curve), ("kr", "한국 국고채 수익률", kr_curve)]:
                     with ui.card().classes("surface p-5"):
                         ui.label(title).classes("font-bold main-text")
-                        with ui.row().classes("w-full gap-3 mt-3 flex-wrap"):
+                        categories = [x.get('tenor') for x in curve]
+                        values = [x.get('value') for x in curve]
+                        ui.echart({
+                            'animation': False,
+                            'grid': {'left': 48, 'right': 15, 'top': 22, 'bottom': 36},
+                            'xAxis': {'type': 'category', 'data': categories, 'axisLabel': {'color': '#94a3b8'}},
+                            'yAxis': {'type': 'value', 'scale': True, 'axisLabel': {'formatter': '{value}%', 'color': '#94a3b8'}},
+                            'series': [{'type': 'line', 'data': values, 'smooth': True, 'symbolSize': 7}],
+                            'tooltip': {'trigger': 'axis'},
+                        }, renderer='canvas').classes('w-full h-[220px]')
+                        with ui.row().classes('w-full gap-2 flex-wrap mt-2'):
                             for point in curve:
-                                with ui.column().classes("gap-0 min-w-[64px]"):
-                                    ui.label(point.get("tenor", "-")).classes("text-xs muted")
-                                    value = point.get("value")
-                                    ui.label("-" if value is None else f"{value:.3f}%").classes("font-black main-text")
+                                tenor = point.get('tenor')
+                                ui.button(
+                                    tenor,
+                                    on_click=lambda _, c=country, t=tenor: ui.navigate.to(f'/bond/{c}/{t}'),
+                                ).props('outline dense no-caps').classes('text-xs')
+
+            with ui.card().classes('surface p-5'):
+                ui.label('미국 장단기 금리차').classes('font-bold main-text')
+                ui.label('10Y-2Y 스프레드 역사차트').classes('text-xs muted mb-2')
+                ui.button('10Y-2Y 차트 보기', icon='show_chart', on_click=lambda: ui.navigate.to('/bond/spread/10Y-2Y')).props('outline no-caps')
+
+        public_heatmap.clear()
+        with public_heatmap:
+            with ui.tabs().classes('w-full dashboard-tabs') as hm_tabs:
+                hm_us = ui.tab('미국', icon='flag')
+                hm_kr = ui.tab('한국', icon='flag')
+            with ui.tab_panels(hm_tabs, value=hm_us).classes('w-full bg-transparent'):
+                with ui.tab_panel(hm_us).classes('p-0'):
+                    ui.echart(echart_treemap(us_heat, 'US Large Cap Heatmap'), renderer='canvas').classes('w-full h-[520px] surface')
+                with ui.tab_panel(hm_kr).classes('p-0'):
+                    if kr_heat:
+                        ui.echart(echart_treemap(kr_heat, 'Korea Market Cap Heatmap'), renderer='canvas').classes('w-full h-[520px] surface')
+                    else:
+                        ui.label('한국 히트맵 데이터를 불러오지 못했습니다.').classes('muted p-5')
 
     def paint_filter_buttons():
         pairs = [
@@ -2009,6 +2056,7 @@ async def personal_dashboard():
             futures_tab2 = ui.tab("선물", icon="candlestick_chart")
             fx_tab2 = ui.tab("환율", icon="currency_exchange")
             bonds_tab2 = ui.tab("채권", icon="timeline")
+            heatmap_tab2 = ui.tab("히트맵", icon="grid_view")
         with ui.tab_panels(market_tabs, value=macro_tab).classes("w-full bg-transparent"):
             with ui.tab_panel(macro_tab).classes("p-0"):
                 macro_grid2 = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-md:grid-cols-2")
@@ -2018,6 +2066,8 @@ async def personal_dashboard():
                 fx_grid2 = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
             with ui.tab_panel(bonds_tab2).classes("p-0"):
                 bonds_host2 = ui.column().classes("w-full mt-3 gap-4")
+            with ui.tab_panel(heatmap_tab2).classes("p-0"):
+                heatmap_host2 = ui.column().classes("w-full mt-3 gap-4")
 
         with macro_grid2:
             for item in macro:
@@ -2032,11 +2082,13 @@ async def personal_dashboard():
                         ui.html(svg).classes("w-full mt-2")
 
         async def render_market_center():
-            futures, fx, us_curve, kr_curve = await asyncio.gather(
+            futures, fx, us_curve, kr_curve, us_heat, kr_heat = await asyncio.gather(
                 asyncio.to_thread(get_futures_snapshot),
                 asyncio.to_thread(get_fx_snapshot),
                 asyncio.to_thread(get_us_yield_curve),
                 asyncio.to_thread(get_kr_yield_curve),
+                asyncio.to_thread(get_us_heatmap),
+                asyncio.to_thread(get_kr_heatmap, kis, 24),
             )
             futures_grid2.clear()
             with futures_grid2:
@@ -2062,10 +2114,10 @@ async def personal_dashboard():
             bonds_host2.clear()
             with bonds_host2:
                 with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
-                    for title, curve in [("미국 국채", us_curve), ("한국 국고채", kr_curve)]:
+                    for country, title, curve in [("us", "미국 국채", us_curve), ("kr", "한국 국고채", kr_curve)]:
                         with ui.card().classes("surface p-5"):
                             ui.label(title).classes("font-bold main-text")
-                            ui.label("만기별 수익률 곡선").classes("text-xs muted")
+                            ui.label("만기별 수익률 곡선 · 만기를 누르면 역사차트").classes("text-xs muted")
                             categories=[x.get("tenor") for x in curve]
                             values=[x.get("value") for x in curve]
                             ui.echart({
@@ -2076,7 +2128,27 @@ async def personal_dashboard():
                                 "series": [{"type": "line", "data": values, "smooth": True, "symbolSize": 7}],
                                 "tooltip": {"trigger": "axis"},
                             }, renderer="canvas").classes("w-full h-[280px]")
-            if not __import__('os').getenv('ECOS_API_KEY'):
+                            with ui.row().classes('w-full gap-2 flex-wrap mt-2'):
+                                for point in curve:
+                                    tenor=point.get('tenor')
+                                    ui.button(tenor, on_click=lambda _, c=country, t=tenor: ui.navigate.to(f'/bond/{c}/{t}')).props('outline dense no-caps')
+                with ui.card().classes('surface p-5'):
+                    ui.label('Yield Spread').classes('font-bold main-text')
+                    ui.button('US 10Y-2Y', icon='show_chart', on_click=lambda: ui.navigate.to('/bond/spread/10Y-2Y')).props('outline no-caps')
+            heatmap_host2.clear()
+            with heatmap_host2:
+                with ui.tabs().classes('w-full dashboard-tabs') as personal_hm_tabs:
+                    ph_us=ui.tab('미국')
+                    ph_kr=ui.tab('한국')
+                with ui.tab_panels(personal_hm_tabs, value=ph_us).classes('w-full bg-transparent'):
+                    with ui.tab_panel(ph_us).classes('p-0'):
+                        ui.echart(echart_treemap(us_heat, 'US Large Cap Heatmap'), renderer='canvas').classes('w-full h-[520px] surface')
+                    with ui.tab_panel(ph_kr).classes('p-0'):
+                        if kr_heat:
+                            ui.echart(echart_treemap(kr_heat, 'Korea Market Cap Heatmap'), renderer='canvas').classes('w-full h-[520px] surface')
+                        else:
+                            ui.label('한국 히트맵 데이터를 불러오지 못했습니다.').classes('muted p-5')
+            if not os.getenv('ECOS_API_KEY'):
                 with bonds_host2:
                     ui.label("한국 국고채 다만기 데이터는 ECOS_API_KEY 설정을 권장합니다. sample 키는 호출 제한이 큽니다.").classes("text-xs muted")
 
@@ -2182,7 +2254,9 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         price_label = ui.label("가격 불러오는 중...").classes("text-3xl font-black main-text")
         change_label = ui.label("-").classes("text-sm font-bold muted")
 
-    extended_host = ui.row().classes("w-full gap-3 mt-3")
+    extended_host = ui.row().classes("w-full gap-3 mt-3 flex-wrap")
+    extended_refs = {}
+    live_badge = ui.label("").classes("text-xs muted mt-1")
 
     with ui.row().classes("w-full items-center gap-3 mt-6"):
         timeframe = ui.toggle(
@@ -2239,21 +2313,54 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             price_label.set_text("조회 실패")
             change_label.set_text(str(exc)[:90])
 
-    async def load_extended_hours():
+    def render_extended_shell():
         extended_host.clear()
-        if market != "US":
-            return
-        try:
-            session = await asyncio.to_thread(get_us_extended_session, symbol)
-        except Exception:
+        extended_refs.clear()
+        if market != 'US':
             return
         with extended_host:
-            labels = [("프리마켓", session.get("premarket")), ("정규장", session.get("regular")), ("애프터마켓", session.get("afterhours"))]
-            for label, value in labels:
-                with ui.card().classes("surface px-4 py-3 min-w-[150px]"):
-                    ui.label(label).classes("text-xs muted")
-                    ui.label("-" if value is None else f"${value:,.2f}").classes("text-lg font-black main-text")
-            ui.label(f"현재 세션: {session.get('session','CLOSED')}").classes("text-xs muted self-center")
+            for key, label in [('premarket','프리마켓'), ('regular','정규장'), ('afterhours','애프터마켓')]:
+                with ui.card().classes('surface px-4 py-3 min-w-[165px]'):
+                    ui.label(label).classes('text-xs muted')
+                    price = ui.label('-').classes('text-lg font-black main-text')
+                    change = ui.label('').classes('text-xs muted')
+                    extended_refs[key] = (price, change)
+            session_ref = ui.label('세션 확인 중...').classes('text-xs muted self-center')
+            extended_refs['session'] = session_ref
+
+    def refresh_extended_from_cache():
+        if market != 'US' or not extended_refs:
+            return
+        snap = us_realtime.get(symbol)
+        for key in ('premarket','regular','afterhours'):
+            price_label, delta_label = extended_refs[key]
+            value = snap.get(key)
+            price_label.set_text('-' if value is None else f'${value:,.2f}')
+            if snap.get('live') and snap.get('session') == {'premarket':'PRE','regular':'REGULAR','afterhours':'POST'}[key]:
+                pct = snap.get('percent')
+                change = snap.get('change')
+                delta_label.set_text('LIVE' if pct is None else f'{change:+.2f} ({pct:+.2f}%)')
+                delta_label.classes(remove='muted positive negative')
+                delta_label.classes(add='positive' if (pct or 0) > 0 else 'negative' if (pct or 0) < 0 else 'muted')
+            else:
+                delta_label.set_text('')
+        session = snap.get('session','CLOSED')
+        source = 'KIS LIVE' if snap.get('live') else snap.get('source','POLL')
+        extended_refs['session'].set_text(f'현재 세션: {session} · {source}')
+
+    async def load_extended_hours():
+        if market != 'US':
+            return
+        try:
+            polled = await asyncio.to_thread(get_us_extended_session, symbol)
+            us_realtime.seed_extended(symbol, polled)
+        except Exception:
+            pass
+        try:
+            await us_realtime.subscribe(symbol, exchange)
+        except Exception:
+            pass
+        refresh_extended_from_cache()
 
     chart_lock = asyncio.Lock()
 
@@ -2294,8 +2401,58 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         trailing_events=True,
     )
 
+    render_extended_shell()
     await asyncio.gather(load_quote(), load_extended_hours(), load_chart())
     ui.timer(REFRESH_SECONDS, load_quote)
+    if market == 'US':
+        ui.timer(1.0, refresh_extended_from_cache)
+        ui.timer(15.0, load_extended_hours)
+
+
+
+@ui.page('/bond/{country}/{tenor}', response_timeout=15)
+async def bond_detail(country: str, tenor: str):
+    add_style()
+    _, set_theme = apply_theme()
+    with ui.row().classes('w-full items-center justify-between'):
+        ui.button('이전 화면', icon='arrow_back', on_click=lambda: ui.run_javascript('history.back()')).props('flat no-caps')
+        with ui.row().classes('items-center gap-2'):
+            theme_menu(set_theme)
+            ui.button('시장 홈', icon='public', on_click=lambda: ui.navigate.to('/')).props('flat no-caps')
+
+    is_spread = country == 'spread'
+    title_text = f'US {tenor} Treasury Yield' if country == 'us' else f'한국 국고채 {tenor}' if country == 'kr' else f'US Yield Spread {tenor}'
+    ui.label(title_text).classes('text-3xl font-black main-text mt-5')
+    ui.label('만기별 금리의 역사적 흐름을 확인합니다.').classes('text-sm muted')
+    years = ui.toggle({1:'1년',3:'3년',5:'5년',10:'10년'}, value=5).props('unelevated').classes('mt-5')
+    status = ui.label('금리 데이터를 준비하고 있습니다...').classes('text-xs muted mt-2')
+    chart = ui.echart({'animation':False,'xAxis':{'type':'category','data':[]},'yAxis':{'type':'value'},'series':[]}, renderer='canvas').classes('w-full h-[560px] chart-wrap mt-3')
+    await ui.context.client.connected()
+
+    async def load_bond_chart():
+        status.set_text('데이터를 불러오는 중...')
+        try:
+            if country == 'us':
+                frame = await asyncio.to_thread(get_us_bond_history, tenor, int(years.value))
+                chart_title = f'US Treasury {tenor}'
+            elif country == 'kr':
+                frame = await asyncio.to_thread(get_kr_bond_history, tenor, int(years.value))
+                chart_title = f'Korea Treasury {tenor}'
+            else:
+                frame = await asyncio.to_thread(get_us_spread_history, tenor, int(years.value))
+                chart_title = f'US Spread {tenor}'
+            options = line_chart_options(frame, chart_title)
+            if not options:
+                raise RuntimeError('표시할 금리 데이터가 없습니다.')
+            chart.options.clear()
+            chart.options.update(options)
+            chart.update()
+            status.set_text('마우스 휠/드래그로 구간을 확대할 수 있습니다.')
+        except Exception as exc:
+            status.set_text(f'금리 차트 조회 실패: {exc}')
+
+    years.on('update:model-value', lambda _: load_bond_chart(), throttle=.2, leading_events=False, trailing_events=True)
+    await load_bond_chart()
 
 
 @ui.page("/indicator/{kind}/{code}", response_timeout=15)

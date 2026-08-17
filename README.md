@@ -322,3 +322,36 @@ ECOS_API_KEY
 ```
 
 No Supabase migration is required for v1.0.
+
+
+## v1.1 Market Intelligence
+
+### Heatmap
+Public and personal Market Center now include a `히트맵` tab.
+- US: large-cap representative universe, tile area uses a stable representative weight and color uses daily return.
+- Korea: KIS market-cap ranking is used; tile area is rank-derived to avoid per-stock extra calls.
+
+### Live US extended hours
+`realtime_market.py` adds a shared in-process KIS WebSocket hub using `HDFSCNT0`.
+- PRE / REGULAR / POST session cards update from the shared cache every 1 second.
+- Yahoo extended-hours polling remains a fallback/seed every 15 seconds.
+- `KIS LIVE` appears when a WebSocket trade was received recently.
+- One process keeps up to 20 detailed-stock subscriptions conservatively.
+
+Add dependency: `websockets` (already included in requirements.txt).
+No new environment variable is required; it reuses `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ENV`.
+
+### Bond intelligence
+Bond panels now include clickable maturities.
+Routes:
+- `/bond/us/2Y`, `/bond/us/5Y`, `/bond/us/10Y`, `/bond/us/30Y`
+- `/bond/kr/3Y`, `/bond/kr/5Y`, `/bond/kr/10Y`, etc.
+- `/bond/spread/10Y-2Y`
+
+Each route provides 1Y / 3Y / 5Y / 10Y historical line charts.
+US data is based on FRED H.15 series. Korea history uses ECOS 817Y002 and works best with `ECOS_API_KEY`.
+
+### Notes
+- KIS WebSocket mapping uses DNAS for NASDAQ, DAMS for AMEX and DNYS as the NYSE/ARCA-family fallback, based on KIS sample conventions.
+- If WebSocket registration is rejected for a particular exchange code, the UI continues with the polling fallback instead of failing the stock page.
+- The heatmap is a market overview visualization, not a complete exchange-wide commercial market-data feed.
