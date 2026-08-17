@@ -260,3 +260,65 @@ The News tab supports:
 - Yahoo
 
 NAVER results and Yahoo results are de-duplicated by normalized title.
+
+## v1.0 Global Markets / Chart Hotfix
+
+### Chart fix
+NiceGUI's EChart `options` property is mutable but is not assigned with a setter.
+This release replaces `chart.options = options` with:
+
+```python
+chart.options.clear()
+chart.options.update(options)
+chart.update()
+```
+
+This fixes the runtime error `property 'options' of 'EChart' object has no setter`.
+
+### US extended-hours
+US stock detail pages show three snapshots when available:
+- pre-market
+- regular session
+- after-hours
+
+The prototype uses Yahoo intraday `prepost=True` data for these session snapshots.
+The main regular quote remains the existing quote source.
+
+### Futures
+A separate Futures view now includes:
+- S&P 500 E-mini
+- NASDAQ 100 E-mini
+- Dow futures
+- Russell 2000 futures
+- WTI crude
+- Gold
+- Silver
+- Copper
+
+### FX
+The Market Center now includes:
+- USD/KRW
+- JPY/KRW
+- EUR/KRW
+- CNY/KRW
+- USD/JPY
+- EUR/USD
+- GBP/USD
+
+### Bonds
+US Treasury curve is built from FRED daily constant-maturity series:
+1M, 3M, 6M, 1Y, 2Y, 5Y, 10Y, 30Y.
+
+Korean government bond curve is loaded from Bank of Korea ECOS table `817Y002`
+by discovering the current item codes dynamically. Add `ECOS_API_KEY` to Render for
+reliable use. The code falls back to the public `sample` key if no key is set, but
+that key is heavily rate-limited.
+
+### Render environment variable
+Optional but strongly recommended:
+
+```text
+ECOS_API_KEY
+```
+
+No Supabase migration is required for v1.0.

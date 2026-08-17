@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 from nicegui import app, ui
 
 from chart_data import get_echart_options
+from global_market_data import (
+    get_futures_snapshot,
+    get_fx_snapshot,
+    get_us_yield_curve,
+    get_kr_yield_curve,
+    get_us_extended_session,
+)
 from indicator_data import make_indicator_options, MARKET_LABELS, MACRO_LABELS
 from dashboard_data import (
     get_macro_overview,
@@ -496,6 +503,7 @@ async def public_home():
         search_component()
 
     market_host = ui.column().classes("w-full mt-9")
+    global_host = ui.column().classes("w-full mt-8")
     stocks_host = ui.column().classes("w-full mt-10")
     macro_host = ui.column().classes("w-full mt-10")
     news_host = ui.column().classes("w-full mt-10")
@@ -511,6 +519,21 @@ async def public_home():
         )
         with market_grid:
             ui.spinner(size="md").classes("m-6")
+
+    with global_host:
+        ui.label("글로벌 시장").classes("section-title")
+        ui.label("선물·환율·국채 금리를 한 화면에서 확인합니다.").classes("text-xs muted mb-3")
+        with ui.tabs().classes("w-full dashboard-tabs") as global_tabs:
+            futures_tab = ui.tab("선물", icon="candlestick_chart")
+            fx_tab = ui.tab("환율", icon="currency_exchange")
+            bonds_tab = ui.tab("채권", icon="timeline")
+        with ui.tab_panels(global_tabs, value=futures_tab).classes("w-full bg-transparent"):
+            with ui.tab_panel(futures_tab).classes("p-0"):
+                public_futures = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
+            with ui.tab_panel(fx_tab).classes("p-0"):
+                public_fx = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
+            with ui.tab_panel(bonds_tab).classes("p-0"):
+                public_bonds = ui.column().classes("w-full mt-3 gap-4")
 
     with stocks_host:
         ui.label("오늘의 대표 종목").classes("section-title")
@@ -593,6 +616,45 @@ async def public_home():
                     svg = mini_svg(item.get("spark") or [], height=42)
                     if svg:
                         ui.html(svg).classes("w-full mt-2")
+
+    async def load_global_snapshot():
+        futures, fx, us_curve, kr_curve = await asyncio.gather(
+            asyncio.to_thread(get_futures_snapshot),
+            asyncio.to_thread(get_fx_snapshot),
+            asyncio.to_thread(get_us_yield_curve),
+            asyncio.to_thread(get_kr_yield_curve),
+        )
+
+        def render_cards(host, rows, value_fmt):
+            host.clear()
+            with host:
+                for item in rows:
+                    pct = item.get("percent")
+                    with ui.card().classes("surface p-4"):
+                        ui.label(item["name"]).classes("text-xs font-bold muted")
+                        value = item.get("value")
+                        ui.label("-" if value is None else value_fmt(item)).classes("text-xl font-black main-text mt-1")
+                        if pct is not None:
+                            ui.label(f"{pct:+.2f}%").classes(f"text-xs font-bold {delta_class(pct)}")
+                        svg = mini_svg(item.get("spark") or [], height=34)
+                        if svg:
+                            ui.html(svg).classes("w-full mt-2")
+
+        render_cards(public_futures, futures, lambda x: f"{x['value']:,.2f}")
+        render_cards(public_fx, fx, lambda x: f"{x['value']:,.4f}" if abs(x['value']) < 100 else f"{x['value']:,.2f}")
+
+        public_bonds.clear()
+        with public_bonds:
+            with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
+                for title, curve in [("미국 국채 수익률", us_curve), ("한국 국고채 수익률", kr_curve)]:
+                    with ui.card().classes("surface p-5"):
+                        ui.label(title).classes("font-bold main-text")
+                        with ui.row().classes("w-full gap-3 mt-3 flex-wrap"):
+                            for point in curve:
+                                with ui.column().classes("gap-0 min-w-[64px]"):
+                                    ui.label(point.get("tenor", "-")).classes("text-xs muted")
+                                    value = point.get("value")
+                                    ui.label("-" if value is None else f"{value:.3f}%").classes("font-black main-text")
 
     def paint_filter_buttons():
         pairs = [
@@ -747,6 +809,7 @@ async def public_home():
     # Major speed-up: independent feeds load in parallel.
     await asyncio.gather(
         load_markets(),
+        load_global_snapshot(),
         load_stocks(),
         load_macro(),
         load_news(),
@@ -1939,20 +2002,85 @@ async def personal_dashboard():
     await render_lab()
 
     with macro_host:
-        ui.label("주요 경제지표").classes("section-title")
-        with ui.grid(columns=4).classes("w-full gap-3 mt-3 max-md:grid-cols-2"):
+        ui.label("Market Center").classes("section-title")
+        ui.label("경제지표·선물·환율·한국/미국 금리곡선을 분리해 봅니다.").classes("text-xs muted")
+        with ui.tabs().classes("w-full dashboard-tabs mt-3") as market_tabs:
+            macro_tab = ui.tab("경제지표", icon="insights")
+            futures_tab2 = ui.tab("선물", icon="candlestick_chart")
+            fx_tab2 = ui.tab("환율", icon="currency_exchange")
+            bonds_tab2 = ui.tab("채권", icon="timeline")
+        with ui.tab_panels(market_tabs, value=macro_tab).classes("w-full bg-transparent"):
+            with ui.tab_panel(macro_tab).classes("p-0"):
+                macro_grid2 = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-md:grid-cols-2")
+            with ui.tab_panel(futures_tab2).classes("p-0"):
+                futures_grid2 = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
+            with ui.tab_panel(fx_tab2).classes("p-0"):
+                fx_grid2 = ui.grid(columns=4).classes("w-full gap-3 mt-3 max-lg:grid-cols-2 max-md:grid-cols-1")
+            with ui.tab_panel(bonds_tab2).classes("p-0"):
+                bonds_host2 = ui.column().classes("w-full mt-3 gap-4")
+
+        with macro_grid2:
             for item in macro:
                 with ui.card().classes("surface market-card p-4") as card:
                     async def open_macro(current=item):
                         ui.navigate.to(f"/indicator/macro/{quote(current['id'], safe='')}")
                     card.on("click", open_macro)
                     ui.label(item["name"]).classes("text-xs font-bold muted")
-                    ui.label(
-                        "-" if item["value"] is None else f"{item['value']:.2f}{item['suffix']}"
-                    ).classes("text-xl font-black main-text")
+                    ui.label("-" if item["value"] is None else f"{item['value']:.2f}{item['suffix']}").classes("text-xl font-black main-text")
                     svg = mini_svg(item.get("spark") or [], height=38)
                     if svg:
                         ui.html(svg).classes("w-full mt-2")
+
+        async def render_market_center():
+            futures, fx, us_curve, kr_curve = await asyncio.gather(
+                asyncio.to_thread(get_futures_snapshot),
+                asyncio.to_thread(get_fx_snapshot),
+                asyncio.to_thread(get_us_yield_curve),
+                asyncio.to_thread(get_kr_yield_curve),
+            )
+            futures_grid2.clear()
+            with futures_grid2:
+                for item in futures:
+                    with ui.card().classes("surface p-4"):
+                        ui.label(item["name"]).classes("text-xs font-bold muted")
+                        ui.label("-" if item.get("value") is None else f"{item['value']:,.2f}").classes("text-xl font-black main-text")
+                        pct=item.get("percent")
+                        if pct is not None:
+                            ui.label(f"{pct:+.2f}%").classes(f"text-xs font-bold {delta_class(pct)}")
+                        svg=mini_svg(item.get("spark") or [], height=34)
+                        if svg: ui.html(svg).classes("w-full mt-2")
+            fx_grid2.clear()
+            with fx_grid2:
+                for item in fx:
+                    with ui.card().classes("surface p-4"):
+                        ui.label(item["name"]).classes("text-xs font-bold muted")
+                        value=item.get("value")
+                        text_value = "-" if value is None else (f"{value:,.4f}" if abs(value)<100 else f"{value:,.2f}")
+                        ui.label(text_value).classes("text-xl font-black main-text")
+                        pct=item.get("percent")
+                        if pct is not None: ui.label(f"{pct:+.2f}%").classes(f"text-xs font-bold {delta_class(pct)}")
+            bonds_host2.clear()
+            with bonds_host2:
+                with ui.grid(columns=2).classes("w-full gap-4 max-md:grid-cols-1"):
+                    for title, curve in [("미국 국채", us_curve), ("한국 국고채", kr_curve)]:
+                        with ui.card().classes("surface p-5"):
+                            ui.label(title).classes("font-bold main-text")
+                            ui.label("만기별 수익률 곡선").classes("text-xs muted")
+                            categories=[x.get("tenor") for x in curve]
+                            values=[x.get("value") for x in curve]
+                            ui.echart({
+                                "animation": False,
+                                "grid": {"left": 45, "right": 15, "top": 30, "bottom": 35},
+                                "xAxis": {"type": "category", "data": categories, "axisLabel": {"color": "#94a3b8"}},
+                                "yAxis": {"type": "value", "scale": True, "axisLabel": {"formatter": "{value}%", "color": "#94a3b8"}},
+                                "series": [{"type": "line", "data": values, "smooth": True, "symbolSize": 7}],
+                                "tooltip": {"trigger": "axis"},
+                            }, renderer="canvas").classes("w-full h-[280px]")
+            if not __import__('os').getenv('ECOS_API_KEY'):
+                with bonds_host2:
+                    ui.label("한국 국고채 다만기 데이터는 ECOS_API_KEY 설정을 권장합니다. sample 키는 호출 제한이 큽니다.").classes("text-xs muted")
+
+        await render_market_center()
 
     with news_host:
         with ui.row().classes("w-full items-end justify-between"):
@@ -2054,6 +2182,8 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         price_label = ui.label("가격 불러오는 중...").classes("text-3xl font-black main-text")
         change_label = ui.label("-").classes("text-sm font-bold muted")
 
+    extended_host = ui.row().classes("w-full gap-3 mt-3")
+
     with ui.row().classes("w-full items-center gap-3 mt-6"):
         timeframe = ui.toggle(
             {"1D": "1일", "D": "일봉", "W": "주봉", "M": "월봉"},
@@ -2109,6 +2239,22 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             price_label.set_text("조회 실패")
             change_label.set_text(str(exc)[:90])
 
+    async def load_extended_hours():
+        extended_host.clear()
+        if market != "US":
+            return
+        try:
+            session = await asyncio.to_thread(get_us_extended_session, symbol)
+        except Exception:
+            return
+        with extended_host:
+            labels = [("프리마켓", session.get("premarket")), ("정규장", session.get("regular")), ("애프터마켓", session.get("afterhours"))]
+            for label, value in labels:
+                with ui.card().classes("surface px-4 py-3 min-w-[150px]"):
+                    ui.label(label).classes("text-xs muted")
+                    ui.label("-" if value is None else f"${value:,.2f}").classes("text-lg font-black main-text")
+            ui.label(f"현재 세션: {session.get('session','CLOSED')}").classes("text-xs muted self-center")
+
     chart_lock = asyncio.Lock()
 
     async def load_chart():
@@ -2126,7 +2272,8 @@ async def stock_detail(market: str, exchange: str, symbol: str):
                     timeframe.value,
                     tuple(ma.value or []),
                 )
-                chart.options = options
+                chart.options.clear()
+                chart.options.update(options)
                 chart.update()
                 status.set_text("마우스 휠/드래그로 확대·축소할 수 있습니다.")
             except Exception as exc:
@@ -2147,7 +2294,7 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         trailing_events=True,
     )
 
-    await asyncio.gather(load_quote(), load_chart())
+    await asyncio.gather(load_quote(), load_extended_hours(), load_chart())
     ui.timer(REFRESH_SECONDS, load_quote)
 
 
@@ -2194,7 +2341,8 @@ async def indicator_detail(kind: str, code: str):
                     make_indicator_options, kind, code, ranges.value
                 )
                 title.set_text(resolved_title)
-                chart.options = options
+                chart.options.clear()
+                chart.options.update(options)
                 chart.update()
                 status.set_text("드래그/휠로 구간을 확대할 수 있습니다.")
             except Exception as exc:
