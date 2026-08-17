@@ -425,3 +425,60 @@ ECOS_API_KEY=<your Bank of Korea ECOS API key>
 ```
 
 The rest of the environment variables are unchanged from v1.1.
+
+## v1.4 Live Sparklines + Korea Bonds
+
+### US representative cards
+
+- KIS HDFSCNT0 remains the preferred source.
+- Subscription pacing changed from 500 ms to 150 ms per symbol.
+- A shared snapshot is requested immediately, so cards do not sit in an endless
+  "connection waiting" state while the WebSocket is starting.
+- The snapshot provider returns today's one-minute PRE/REG/POST history.
+- Each KIS WebSocket trade is appended to a rolling server-side series.
+- Public card mini charts update once per second only when the series changed.
+- If a WebSocket tick is stale, the shared snapshot fallback refreshes roughly
+  every 3-5 seconds rather than showing no status.
+
+Status examples:
+
+```text
+● REG LIVE
+● REG · SNAPSHOT
+● REG · WS READY
+```
+
+### Korean government bond curve
+
+The ECOS `817Y002` curve now uses direct tenor item codes instead of relying on
+`StatisticItemList` discovery:
+
+```text
+1Y  010190000
+2Y  010195000
+3Y  010200000
+5Y  010200001
+10Y 010210000
+20Y 010220000
+30Y 010230000
+```
+
+Current maturities are requested concurrently. Historical tenor series are also
+loaded concurrently when the historical YC tab is opened. Last successful
+current values remain visible if a later ECOS request fails.
+
+If every Korean tenor is blank, the Bonds UI now explicitly asks you to verify
+`ECOS_API_KEY` and provides a retry button.
+
+### Files changed from v1.3
+
+```text
+main.py
+realtime_market.py
+global_market_data.py
+bond_ui.py
+README.md
+```
+
+No Supabase migration, `requirements.txt`, or `render.yaml` change is required.
+`render.yaml` already contains the optional `ECOS_API_KEY` environment variable.

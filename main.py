@@ -448,6 +448,29 @@ def mini_svg(values, width=260, height=52):
     )
 
 
+def live_spark_options(points, positive=True):
+    values = [round(float(p[1]), 4) for p in (points or [])[-120:]]
+    labels = [datetime.fromtimestamp(float(p[0]), ZoneInfo("America/New_York")).strftime("%H:%M:%S") for p in (points or [])[-120:]]
+    color = "#ff4d57" if positive else "#4594ff"
+    return {
+        "animation": False,
+        "backgroundColor": "transparent",
+        "grid": {"left": 2, "right": 2, "top": 5, "bottom": 3},
+        "xAxis": {"type": "category", "data": labels, "show": False, "boundaryGap": False},
+        "yAxis": {"type": "value", "show": False, "scale": True},
+        "tooltip": {"trigger": "axis", "formatter": "{c}"},
+        "series": [{
+            "type": "line",
+            "data": values,
+            "showSymbol": False,
+            "smooth": False,
+            "connectNulls": True,
+            "lineStyle": {"width": 2, "color": color},
+            "areaStyle": {"opacity": 0.04, "color": color},
+        }],
+    }
+
+
 def search_component(target_route="/stock"):
     with ui.column().classes("w-full"):
         ui.label("종목 검색").classes("section-title")
@@ -727,26 +750,38 @@ async def public_home():
                 refs["pct"].classes(remove="positive negative muted")
                 refs["pct"].classes(add=delta_class(float(pct)))
 
+            # The mini chart now follows today's PRE/REG/POST minute seed and
+            # then grows with KIS WebSocket ticks. Update only when the series
+            # changed so 12 cards do not redraw unnecessarily every second.
+            seq = int(snap.get("tick_seq", 0))
+            points = snap.get("live_points") or []
+            if points and seq != refs.get("tick_seq"):
+                chart = refs.get("spark_chart")
+                if chart is not None:
+                    options = live_spark_options(points, positive=(pct or 0) >= 0)
+                    chart.options.clear()
+                    chart.options.update(options)
+                    chart.update()
+                    refs["tick_seq"] = seq
+
             session_short = {"PRE": "PRE", "REGULAR": "REG", "POST": "POST"}.get(session, session)
+            refs["session"].classes(remove="muted positive negative")
             if state_name == "LIVE":
                 label = f"● {session_short} LIVE"
-                refs["session"].classes(remove="muted positive negative")
                 refs["session"].classes(add="positive" if (pct or 0) >= 0 else "negative")
-            elif state_name == "FALLBACK":
-                label = f"◌ {session_short} · 12s FALLBACK"
-                refs["session"].classes(remove="positive negative")
+            elif state_name == "SNAPSHOT":
+                label = f"● {session_short} · SNAPSHOT"
                 refs["session"].classes(add="muted")
             elif state_name == "ACKED":
-                label = f"◌ {session_short} · WS 구독됨"
-                refs["session"].classes(remove="positive negative")
+                label = f"● {session_short} · WS READY"
                 refs["session"].classes(add="muted")
             elif state_name == "ERROR":
-                label = f"! {session_short} · REST fallback"
-                refs["session"].classes(remove="positive negative")
+                label = f"● {session_short} · SNAPSHOT"
                 refs["session"].classes(add="muted")
             else:
-                label = f"◌ {session_short} · WS 구독중" if session != "CLOSED" else ""
-                refs["session"].classes(remove="positive negative")
+                # The snapshot task starts immediately, so this state should
+                # normally last only a moment and is no longer called 연결대기.
+                label = f"{session_short} · 시세 준비중" if session != "CLOSED" else ""
                 refs["session"].classes(add="muted")
             refs["session"].set_text(label)
 
@@ -801,9 +836,20 @@ async def public_home():
                         "text-[10px] muted min-h-[16px] mt-1"
                     )
 
-                    svg = mini_svg(item.get("spark") or [], height=58)
-                    if svg:
-                        ui.html(svg).classes("w-full mt-2")
+                    spark_chart = None
+                    if item.get("market") == "US":
+                        # Start with the historical mini trend; the first shared
+                        # snapshot replaces it with today's intraday series and
+                        # WebSocket ticks keep extending it once per second.
+                        seed = [[i, v] for i, v in enumerate(item.get("spark") or [])]
+                        spark_chart = ui.echart(
+                            live_spark_options(seed, positive=(pct or 0) >= 0),
+                            renderer="canvas",
+                        ).classes("w-full h-[72px] mt-2")
+                    else:
+                        svg = mini_svg(item.get("spark") or [], height=58)
+                        if svg:
+                            ui.html(svg).classes("w-full mt-2")
                     ui.label("클릭해서 상세 차트").classes(
                         "text-[11px] soft mt-1"
                     )
@@ -814,6 +860,8 @@ async def public_home():
                             "pct": pct_ref,
                             "session": session_ref,
                             "exchange": item.get("exchange", ""),
+                            "spark_chart": spark_chart,
+                            "tick_seq": -1,
                         }
 
         if state["market"] == "US" and public_stock_refs:
@@ -2376,7 +2424,7 @@ async def stock_detail(market: str, exchange: str, symbol: str):
             price_label.set_text(f"${float(display_last):,.2f}")
             live_change = snap.get('display_change')
             live_pct = snap.get('display_percent')
-            prefix = 'LIVE' if snap.get('state') == 'LIVE' else 'FALLBACK'
+            prefix = 'LIVE' if snap.get('state') == 'LIVE' else 'SNAPSHOT'
             change_label.set_text(
                 prefix if live_change is None or live_pct is None
                 else f"${float(live_change):+,.2f} ({float(live_pct):+.2f}%) · {prefix}"
@@ -2397,10 +2445,10 @@ async def stock_detail(market: str, exchange: str, symbol: str):
         session = snap.get('session','CLOSED')
         source_map = {
             'LIVE': 'KIS WS LIVE',
-            'FALLBACK': '12s FALLBACK',
-            'ACKED': 'KIS WS 구독됨 · 체결대기',
-            'ERROR': 'WS ERROR · FALLBACK',
-            'SUBSCRIBING': 'KIS WS 구독중',
+            'SNAPSHOT': '3~5s SNAPSHOT',
+            'ACKED': 'KIS WS READY',
+            'ERROR': 'SNAPSHOT 사용중',
+            'SUBSCRIBING': '시세 준비중',
         }
         source = source_map.get(snap.get('state'), snap.get('source','POLL'))
         extended_refs['session'].set_text(f'현재 세션: {session} · {source}')

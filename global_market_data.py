@@ -850,3 +850,331 @@ def get_us_extended_batch(items):
         return result
 
     return _cached("us-extended-batch:" + ",".join(symbols), 12, load)
+
+# ---------------------------------------------------------------------------
+# v1.4 realtime-card snapshots + robust Korean Treasury curve
+# ---------------------------------------------------------------------------
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ECOS 817Y002 item codes for Korean Treasury yields.
+# Keeping a complete static map avoids a slow/fragile StatisticItemList lookup.
+KR_BOND_STATIC_V14 = {
+    "1Y": ("010190000", "국고채(1년)"),
+    "2Y": ("010195000", "국고채(2년)"),
+    "3Y": ("010200000", "국고채(3년)"),
+    "5Y": ("010200001", "국고채(5년)"),
+    "10Y": ("010210000", "국고채(10년)"),
+    "20Y": ("010220000", "국고채(20년)"),
+    "30Y": ("010230000", "국고채(30년)"),
+}
+
+
+def _ecos_series_v14(item_code, start, end, timeout=8):
+    """Direct ECOS series request for 817Y002.
+
+    A direct item-code request is substantially more reliable than discovering
+    item codes at request time. 5 years of business-day observations fit well
+    below 5,000 rows.
+    """
+    key = _ecos_key()
+    url = (
+        f"https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/1/5000/"
+        f"817Y002/D/{start:%Y%m%d}/{end:%Y%m%d}/{item_code}"
+    )
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "MyMarket/1.4 (+personal-dashboard)"},
+    )
+    response.raise_for_status()
+    body = response.json()
+    block = body.get("StatisticSearch") or {}
+    rows = block.get("row") or []
+    data = []
+    for row in rows:
+        try:
+            dt = pd.to_datetime(row.get("TIME"), format="%Y%m%d", errors="coerce")
+            value = float(row.get("DATA_VALUE"))
+        except Exception:
+            continue
+        if pd.isna(dt):
+            continue
+        data.append({"date": dt, "value": value})
+    if not data:
+        return pd.DataFrame(columns=["date", "value"])
+    return (
+        pd.DataFrame(data)
+        .drop_duplicates("date")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
+def _kr_lkg_points():
+    hit = _CACHE.get("kr-v14-lkg")
+    return dict(hit[1]) if hit else {}
+
+
+def get_kr_yield_curve():
+    """Current Korean Treasury curve, fetched concurrently by tenor.
+
+    The old implementation first tried to discover item codes and then queried
+    maturities one by one. This version uses the stable 817Y002 codes directly,
+    runs all requests in parallel, and keeps the last successful points when an
+    individual ECOS request fails.
+    """
+    cached = _CACHE.get("kr-curve-v14")
+    if cached and time.time() - cached[0] < 600:
+        return cached[1]
+
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    start = today - timedelta(days=75)
+    fresh = {}
+    errors = {}
+
+    def one(tenor, code, name):
+        frame = _ecos_series_v14(code, start, today, timeout=7)
+        if frame.empty:
+            raise RuntimeError("empty ECOS series")
+        row = frame.iloc[-1]
+        return tenor, {
+            "tenor": tenor,
+            "value": float(row["value"]),
+            "name": name,
+            "series": code,
+            "stale": False,
+            "updated_at": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+            "source": "ECOS",
+        }
+
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        futures = {
+            pool.submit(one, tenor, code, name): tenor
+            for tenor, (code, name) in KR_BOND_STATIC_V14.items()
+        }
+        for future in as_completed(futures):
+            tenor = futures[future]
+            try:
+                t, point = future.result()
+                fresh[t] = point
+            except Exception as exc:
+                errors[tenor] = str(exc)[:100]
+
+    lkg = _kr_lkg_points()
+    merged = dict(lkg)
+    merged.update(fresh)
+    if fresh:
+        _CACHE["kr-v14-lkg"] = (time.time(), merged)
+
+    result = []
+    for tenor, (code, name) in KR_BOND_STATIC_V14.items():
+        if tenor in fresh:
+            point = fresh[tenor]
+        elif tenor in merged:
+            point = dict(merged[tenor])
+            point["stale"] = True
+            point["error"] = errors.get(tenor, "")
+        else:
+            point = {
+                "tenor": tenor,
+                "value": None,
+                "name": name,
+                "series": code,
+                "stale": True,
+                "updated_at": None,
+                "source": "ECOS",
+                "error": errors.get(tenor, "데이터 없음"),
+            }
+        result.append(point)
+
+    _CACHE["kr-curve-v14"] = (time.time(), result)
+    return result
+
+
+def get_kr_bond_history(tenor="10Y", years=5):
+    key = f"kr-bond-history-v14:{tenor}:{years}"
+    cached = _CACHE.get(key)
+    if cached and time.time() - cached[0] < 1800:
+        return cached[1]
+
+    code, _ = KR_BOND_STATIC_V14.get(tenor, (None, None))
+    if not code:
+        return pd.DataFrame(columns=["date", "value"])
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    start = today - timedelta(days=int(365.25 * int(years)) + 60)
+    try:
+        frame = _ecos_series_v14(code, start, today, timeout=10)
+    except Exception:
+        frame = pd.DataFrame(columns=["date", "value"])
+    _CACHE[key] = (time.time(), frame)
+    return frame
+
+
+def get_kr_curve_history_matrix(years=5):
+    key = f"kr-curve-matrix-v14:{years}"
+    cached = _CACHE.get(key)
+    if cached and time.time() - cached[0] < 3600:
+        return cached[1]
+
+    frames = {}
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        futures = {
+            pool.submit(get_kr_bond_history, tenor, years): tenor
+            for tenor in KR_BOND_STATIC_V14
+        }
+        for future in as_completed(futures):
+            tenor = futures[future]
+            try:
+                frame = future.result()
+            except Exception:
+                continue
+            if frame is not None and not frame.empty:
+                frames[tenor] = frame[["date", "value"]].rename(columns={"value": tenor})
+
+    if not frames:
+        result = pd.DataFrame()
+    else:
+        ordered = [frames[t] for t in KR_BOND_STATIC_V14 if t in frames]
+        result = ordered[0]
+        for frame in ordered[1:]:
+            result = pd.merge(result, frame, on="date", how="outer")
+        result = result.sort_values("date").ffill()
+
+    _CACHE[key] = (time.time(), result)
+    return result
+
+
+def get_kr_spread_history(spread="10Y-2Y", years=5):
+    key = f"kr-spread-v14:{spread}:{years}"
+    cached = _CACHE.get(key)
+    if cached and time.time() - cached[0] < 1800:
+        return cached[1]
+    if spread != "10Y-2Y":
+        return pd.DataFrame(columns=["date", "value"])
+    matrix = get_kr_curve_history_matrix(years)
+    if matrix is None or matrix.empty or "10Y" not in matrix or "2Y" not in matrix:
+        result = pd.DataFrame(columns=["date", "value"])
+    else:
+        result = matrix[["date", "10Y", "2Y"]].dropna().copy()
+        result["value"] = result["10Y"] - result["2Y"]
+        result = result[["date", "value"]]
+    _CACHE[key] = (time.time(), result)
+    return result
+
+
+def curve_at_date(country="us", target_date=None, years=5):
+    target = pd.Timestamp(target_date or datetime.now().date()).tz_localize(None)
+    if country == "us":
+        frame = get_us_curve_history_matrix(years)
+        mapping = {tenor: series for series, tenor in US_TREASURY}
+        tenors = [tenor for _, tenor in US_TREASURY]
+    else:
+        frame = get_kr_curve_history_matrix(years)
+        mapping = {t: t for t in KR_BOND_STATIC_V14}
+        tenors = list(mapping)
+    if frame is None or frame.empty:
+        return []
+    dates = pd.to_datetime(frame["date"]).dt.tz_localize(None)
+    subset = frame[dates <= target]
+    if subset.empty:
+        return []
+    row = subset.iloc[-1]
+    return [
+        {
+            "tenor": tenor,
+            "value": None if pd.isna(row.get(mapping[tenor])) else float(row.get(mapping[tenor])),
+        }
+        for tenor in tenors
+    ]
+
+
+def curve_available_dates(country="us", years=5):
+    frame = get_us_curve_history_matrix(years) if country == "us" else get_kr_curve_history_matrix(years)
+    if frame is None or frame.empty:
+        return []
+    return [
+        d.strftime("%Y-%m-%d")
+        for d in pd.to_datetime(frame["date"]).dropna().drop_duplicates().tolist()
+    ]
+
+
+def get_us_extended_batch(items):
+    """Shared US extended-hours snapshot plus one-minute intraday seed.
+
+    The whole visible US card set is downloaded in one request. The returned
+    minute history lets cards immediately show today's shape; KIS WebSocket
+    ticks then extend that shape second by second.
+    """
+    if not items:
+        return {}
+    symbols = [str(s).upper() for s, _ in items]
+    cache_key = "us-extended-batch-v14:" + ",".join(sorted(symbols))
+    cached = _CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < 4:
+        return cached[1]
+
+    try:
+        frame = yf.download(
+            symbols,
+            period="1d",
+            interval="1m",
+            prepost=True,
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+            group_by="column",
+        )
+    except Exception:
+        return cached[1] if cached else {}
+
+    if frame is None or frame.empty:
+        return cached[1] if cached else {}
+
+    now_session = "CLOSED"
+    now = datetime.now(ZoneInfo("America/New_York"))
+    hm = (now.hour, now.minute)
+    if now.weekday() < 5:
+        if (4, 0) <= hm < (9, 30):
+            now_session = "PRE"
+        elif (9, 30) <= hm < (16, 0):
+            now_session = "REGULAR"
+        elif (16, 0) <= hm < (20, 0):
+            now_session = "POST"
+
+    result = {}
+    for symbol in symbols:
+        try:
+            if isinstance(frame.columns, pd.MultiIndex):
+                closes = pd.to_numeric(frame[("Close", symbol)], errors="coerce").dropna()
+            else:
+                closes = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+            if closes.empty:
+                continue
+            last = float(closes.iloc[-1])
+            # Use the timestamp index as the x-axis seed for the live mini chart.
+            intraday = []
+            for idx, value in closes.tail(180).items():
+                try:
+                    ts = pd.Timestamp(idx).timestamp()
+                    intraday.append([ts, float(value)])
+                except Exception:
+                    pass
+            result[symbol] = {
+                "last": last,
+                "premarket": last if now_session == "PRE" else None,
+                "regular": last if now_session == "REGULAR" else None,
+                "afterhours": last if now_session == "POST" else None,
+                "session": now_session,
+                "intraday": intraday,
+            }
+        except Exception:
+            continue
+
+    _CACHE[cache_key] = (time.time(), result)
+    return result
+
+
+def refresh_kr_yield_curve():
+    """Force a fresh Korean Treasury lookup (used by the UI retry button)."""
+    _CACHE.pop("kr-curve-v14", None)
+    return get_kr_yield_curve()

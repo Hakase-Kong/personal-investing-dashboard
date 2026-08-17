@@ -8,6 +8,7 @@ from global_market_data import (
     get_kr_spread_history,
     get_us_spread_history,
     line_chart_options,
+    refresh_kr_yield_curve,
 )
 
 
@@ -110,6 +111,24 @@ async def render_bond_panel(host, us_curve=None, kr_curve=None):
                             ui.label(title).classes("font-bold main-text")
                             ui.label(_curve_status(curve)).classes("text-[10px] muted")
                         ui.echart(_current_curve_options(curve, title), renderer="canvas").classes("w-full h-[300px]")
+                        if country == "kr" and not any(x.get("value") is not None for x in curve):
+                            ui.label(
+                                "한국 국고채를 불러오지 못했습니다. Render의 ECOS_API_KEY를 확인한 뒤 다시 조회해보세요."
+                            ).classes("text-xs negative mt-1")
+
+                            async def retry_kr():
+                                nonlocal kr_curve
+                                try:
+                                    kr_curve = await asyncio.to_thread(refresh_kr_yield_curve)
+                                    await load_current()
+                                except Exception as exc:
+                                    ui.notify(f"ECOS 재조회 실패: {exc}", type="negative")
+
+                            ui.button(
+                                "한국채권 다시 조회",
+                                icon="refresh",
+                                on_click=retry_kr,
+                            ).props("outline dense no-caps").classes("mt-2")
                         with ui.row().classes("w-full gap-2 flex-wrap mt-2"):
                             for point in curve:
                                 tenor = point.get("tenor")
